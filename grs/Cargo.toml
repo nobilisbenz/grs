@@ -1,0 +1,38 @@
+[package]
+name = "grs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "grs CLI/TUI: minimal replay timelapse for file edits"
+
+[[bin]]
+name = "grs"
+path = "src/main.rs"
+
+[dependencies]
+grs-lib = { workspace = true }
+clap = { workspace = true }
+clap_complete = { workspace = true }
+crossterm = { workspace = true }
+ratatui = { workspace = true }
+syntect = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+similar = { workspace = true }
+toml = { workspace = true }
+toml_edit = { workspace = true }
+clap_mangen = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+insta = { workspace = true }
+
+[lints]
+workspace = true

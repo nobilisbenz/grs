@@ -1,0 +1,249 @@
+//! Tiny vim-style key parser. Holds a small buffer for multi-key sequences
+//! (`gg`, `:N<Enter>`) with a 500ms timeout.
+
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+/// What the parser is currently collecting.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum KeyState {
+    Idle,
+    /// User pressed `g`; waiting for the second `g` of `gg`.
+    PendingG,
+    /// User pressed `:`; collecting digits until `Enter`/`Esc`.
+    PendingColon(String),
+}
+
+/// Outcome of feeding a key.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum KeyOutcome {
+    /// A complete, immediately-actionable key.
+    Action(KeyAction),
+    /// Buffer updated; no action yet (caller should keep listening).
+    Pending(KeyState),
+    /// Esc / timeout / etc. — buffer cleared, no action.
+    Cleared,
+}
+
+/// All actions the TUI handles.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum KeyAction {
+    Quit,
+    Back,
+    Down,
+    Up,
+    Left,
+    Right,
+    StepBack,  // `h` in replay
+    StepFwd,   // `l` in replay
+    PlayPause,
+    Faster,
+    Slower,
+    GotoFirst, // `gg`
+    GotoLast,  // `G`
+    GotoSnap(usize), // `:N<Enter>`
+    TabFile,
+    Refresh,
+    /// Show diff popup for the selected session (session list only).
+    ShowDiff,
+    /// Toggle side-by-side (old | new) view (replay only).
+    SideBySide,
+    Enter,     // session list -> open replay
+    Filter,    // `/`
+    ConfirmFilter, // Enter in filter mode
+    CancelFilter,
+    /// Pass-through char into the filter input.
+    FilterChar(char),
+    /// Backspace in filter input.
+    FilterBackspace,
+    /// No-op (unhandled).
+    None,
+}
+
+pub struct VimParser {
+    state: KeyState,
+}
+
+impl Default for VimParser {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl VimParser {
+    pub fn new() -> Self {
+        Self { state: KeyState::Idle }
+    }
+
+    pub fn state(&self) -> &KeyState {
+        &self.state
+    }
+
+    /// Reset the parser (e.g. on timeout or screen change).
+    pub fn reset(&mut self) {
+        self.state = KeyState::Idle;
+    }
+
+    pub fn feed(&mut self, key: KeyEvent) -> KeyOutcome {
+        // Ctrl-C is always quit.
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+            return KeyOutcome::Action(KeyAction::Quit);
+        }
+
+        // Handle filter-input state first (we're typing into a buffer).
+        if let KeyState::PendingColon(ref mut buf) = self.state {
+            match key.code {
+                KeyCode::Esc => {
+                    self.reset();
+                    return KeyOutcome::Action(KeyAction::CancelFilter);
+                }
+                KeyCode::Enter => {
+                    let n: usize = buf.parse().unwrap_or(0);
+                    self.reset();
+                    return KeyOutcome::Action(KeyAction::GotoSnap(n));
+                }
+                KeyCode::Backspace => {
+                    buf.pop();
+                    return KeyOutcome::Pending(self.state.clone());
+                }
+                KeyCode::Char(c) if c.is_ascii_digit() => {
+                    buf.push(c);
+                    return KeyOutcome::Pending(self.state.clone());
+                }
+                _ => return KeyOutcome::Pending(self.state.clone()),
+            }
+        }
+
+        match key.code {
+            KeyCode::Char('q') | KeyCode::Esc => {
+                self.reset();
+                KeyOutcome::Action(KeyAction::Quit)
+            }
+            KeyCode::Char('Q') | KeyCode::Char('i') => {
+                // Reserved: ignore
+                self.reset();
+                KeyOutcome::Action(KeyAction::None)
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                self.reset();
+                KeyOutcome::Action(KeyAction::Down)
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.reset();
+                KeyOutcome::Action(KeyAction::Up)
+            }
+            KeyCode::Char('h') | KeyCode::Left => {
+                self.reset();
+                KeyOutcome::Action(KeyAction::StepBack)
+            }
+            KeyCode::Char('l') | KeyCode::Right => {
+                self.reset();
+                KeyOutcome::Action(KeyAction::StepFwd)
+            }
+            KeyCode::Char(' ') => {
+                self.reset();
+                KeyOutcome::Action(KeyAction::PlayPause)
+            }
+            KeyCode::Char('+') | KeyCode::Char('=') => {
+                self.reset();
+                KeyOutcome::Action(KeyAction::Faster)
+            }
+            KeyCode::Char('-') | KeyCode::Char('_') => {
+                self.reset();
+                KeyOutcome::Action(KeyAction::Slower)
+            }
+            KeyCode::Char('g') => match self.state {
+                KeyState::Idle => {
+                    self.state = KeyState::PendingG;
+                    KeyOutcome::Pending(self.state.clone())
+                }
+                KeyState::PendingG => {
+                    self.reset();
+                    KeyOutcome::Action(KeyAction::GotoFirst)
+                }
+                _ => {
+                    self.reset();
+                    KeyOutcome::Action(KeyAction::None)
+                }
+            },
+            KeyCode::Char('G') => {
+                self.reset();
+                KeyOutcome::Action(KeyAction::GotoLast)
+            }
+            KeyCode::Char(':') => {
+                self.state = KeyState::PendingColon(String::new());
+                KeyOutcome::Pending(self.state.clone())
+            }
+            KeyCode::Tab => {
+                self.reset();
+                KeyOutcome::Action(KeyAction::TabFile)
+            }
+            KeyCode::Char('r') => {
+                self.reset();
+                KeyOutcome::Action(KeyAction::Refresh)
+            }
+            KeyCode::Char('d') => {
+                self.reset();
+                KeyOutcome::Action(KeyAction::ShowDiff)
+            }
+            KeyCode::Char('s') => {
+                self.reset();
+                KeyOutcome::Action(KeyAction::SideBySide)
+            }
+            KeyCode::Enter => {
+                self.reset();
+                KeyOutcome::Action(KeyAction::Enter)
+            }
+            KeyCode::Char('/') => {
+                self.reset();
+                KeyOutcome::Action(KeyAction::Filter)
+            }
+            _ => {
+                self.reset();
+                KeyOutcome::Action(KeyAction::None)
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn k(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn gg_is_goto_first() {
+        let mut p = VimParser::new();
+        assert!(matches!(p.feed(k('g')), KeyOutcome::Pending(_)));
+        assert!(matches!(p.feed(k('g')), KeyOutcome::Action(KeyAction::GotoFirst)));
+    }
+
+    #[test]
+    fn colon_digits_enter_jumps() {
+        let mut p = VimParser::new();
+        assert!(matches!(p.feed(k(':')), KeyOutcome::Pending(_)));
+        let _ = p.feed(k('1'));
+        let _ = p.feed(k('2'));
+        let outcome = p.feed(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(outcome, KeyOutcome::Action(KeyAction::GotoSnap(12))));
+    }
+
+    #[test]
+    fn j_k_h_l() {
+        let mut p = VimParser::new();
+        assert!(matches!(p.feed(k('j')), KeyOutcome::Action(KeyAction::Down)));
+        assert!(matches!(p.feed(k('k')), KeyOutcome::Action(KeyAction::Up)));
+        assert!(matches!(p.feed(k('h')), KeyOutcome::Action(KeyAction::StepBack)));
+        assert!(matches!(p.feed(k('l')), KeyOutcome::Action(KeyAction::StepFwd)));
+    }
+
+    #[test]
+    fn reset_after_non_g_char() {
+        let mut p = VimParser::new();
+        let _ = p.feed(k('g'));
+        let _ = p.feed(k('x')); // not g
+        assert!(matches!(p.state, KeyState::Idle));
+    }
+}
