@@ -298,3 +298,86 @@ fn periodic_refresh_does_not_reset_scroll() {
     replay.on_action(KeyAction::StepFwd, &mut parser);
     assert_eq!(replay.file_view.scroll, 0);
 }
+
+// ---------------------------------------------------------------------
+// Session list view (TUI shell home screen).
+// ---------------------------------------------------------------------
+
+#[test]
+fn session_list_loads_with_initial_session() {
+    use grs::tui::input::KeyAction;
+    use grs::tui::session_list::{ListCmd, SessionListState};
+    let dir = tempfile::tempdir().unwrap();
+    let store = grs_lib::store::RepoStore::init(dir.path()).unwrap();
+    let mut list = SessionListState::load(store);
+    // init() always creates a fresh open session; the list isn't empty.
+    assert_eq!(list.sessions.len(), 1);
+    assert_eq!(list.list_state.selected(), Some(0));
+    // Quit works.
+    assert!(matches!(list.on_action(KeyAction::Quit), ListCmd::Quit));
+}
+
+#[test]
+fn session_list_cursor_moves_with_j_k() {
+    use grs::tui::input::KeyAction;
+    use grs::tui::session_list::{ListCmd, SessionListState};
+    let dir = tempfile::tempdir().unwrap();
+    let store = grs_lib::store::RepoStore::init(dir.path()).unwrap();
+    let _original_head = store.head().unwrap().unwrap();
+    // Make a second session so we have something to navigate.
+    store.rotate_open_session(2_000_000_000_000).unwrap();
+    let mut list = SessionListState::load(store);
+    assert_eq!(list.sessions.len(), 2);
+    // Both sessions are present; ordering depends on their started_at
+    // (already verified by SessionStore::list tests).
+    // Cursor starts at 0; Down moves to 1, clamps at 1, Up returns to 0.
+    assert_eq!(list.list_state.selected(), Some(0));
+    assert!(matches!(list.on_action(KeyAction::Down), ListCmd::Stay));
+    assert_eq!(list.list_state.selected(), Some(1));
+    // Move down at the bottom: clamps.
+    assert!(matches!(list.on_action(KeyAction::Down), ListCmd::Stay));
+    assert_eq!(list.list_state.selected(), Some(1));
+    // Move up.
+    assert!(matches!(list.on_action(KeyAction::Up), ListCmd::Stay));
+    assert_eq!(list.list_state.selected(), Some(0));
+    // Move up at the top: clamps to 0.
+    assert!(matches!(list.on_action(KeyAction::Up), ListCmd::Stay));
+    assert_eq!(list.list_state.selected(), Some(0));
+}
+
+#[test]
+fn session_list_enter_opens_code_review() {
+    use grs::tui::input::KeyAction;
+    use grs::tui::session_list::{ListCmd, SessionListState};
+    let dir = tempfile::tempdir().unwrap();
+    let store = grs_lib::store::RepoStore::init(dir.path()).unwrap();
+    let mut list = SessionListState::load(store);
+    assert_eq!(list.sessions.len(), 1);
+    match list.on_action(KeyAction::Enter) {
+        ListCmd::OpenCodeReview(s) => assert!(s.is_open()),
+        other => panic!("expected OpenCodeReview, got {other:?}"),
+    }
+}
+
+#[test]
+fn session_list_renders_to_backend() {
+    use grs::tui::session_list::SessionListState;
+    use ratatui::Terminal;
+    let dir = tempfile::tempdir().unwrap();
+    let store = grs_lib::store::RepoStore::init(dir.path()).unwrap();
+    let mut list = SessionListState::load(store);
+    let backend = TestBackend::new(120, 12);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal
+        .draw(|f| grs::tui::session_list::render(f, &mut list))
+        .unwrap();
+    let buffer = terminal.backend().buffer().clone();
+    let text: String = buffer
+        .content
+        .iter()
+        .map(|c| c.symbol().chars().next().unwrap_or(' '))
+        .collect();
+    // Title + status text + the session short id should all be present.
+    assert!(text.contains("sessions"), "missing 'sessions' title");
+    assert!(text.contains("move"), "status bar missing");
+}

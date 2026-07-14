@@ -16,7 +16,11 @@ impl SessionStore {
         Self { paths }
     }
 
-    /// List all sessions, newest-first (ULIDs sort chronologically).
+    /// List all sessions, newest-first by `started_at`. (ULIDs alone are not
+    /// reliable for newest-first within a single millisecond: `ulid::new()`
+    /// uses a random tail, so two sessions created in the same ms can sort
+    /// in either order. `started_at` is a wall-clock millis timestamp and
+    /// gives a stable ordering.)
     pub fn list(&self) -> Result<Vec<Session>> {
         let mut sessions = Vec::new();
         if !self.paths.sessions_dir.is_dir() {
@@ -36,7 +40,7 @@ impl SessionStore {
                 sessions.push(s);
             }
         }
-        sessions.sort_by(|a, b| b.id.cmp(&a.id));
+        sessions.sort_by(|a, b| b.started_at.cmp(&a.started_at));
         Ok(sessions)
     }
 

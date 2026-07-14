@@ -47,10 +47,9 @@ pub async fn run_command(ui: &mut Ui, command: &CommandHelper, args: &Args) -> R
     let cmd = match &args.command {
         Some(c) => c,
         None => {
-            // No subcommand: open the replay for the current session.
+            // No subcommand: open the TUI shell at the session list.
             let store = command.store_or_init().map_err(CommandError::from)?;
-            let session = store.current_session().map_err(CommandError::from)?;
-            return crate::tui::run_replay(store, session);
+            return crate::tui::run_tui(store);
         }
     };
     match cmd {
