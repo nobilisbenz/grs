@@ -74,6 +74,8 @@ pub struct CodeReviewState {
     /// Cached mtime (seconds) of the session's snaps dir, used to short-
     /// circuit `refresh()` when no new snaps have landed.
     pub last_snaps_mtime: Option<i64>,
+    /// True while the help overlay is shown.
+    pub help_open: bool,
 }
 
 impl CodeReviewState {
@@ -105,6 +107,7 @@ impl CodeReviewState {
             cached_lines: None,
             last_loaded_seq: None,
             last_snaps_mtime: None,
+            help_open: false,
         };
         s.refresh_current();
         s
@@ -302,6 +305,10 @@ impl CodeReviewState {
                 CodeReviewCmd::Stay
             }
             KeyAction::Quit | KeyAction::Back => CodeReviewCmd::Pop,
+            KeyAction::Help => {
+                self.help_open = !self.help_open;
+                CodeReviewCmd::Stay
+            }
             // n/N: next/prev change row in the current snap. The parser
             // emits these as NewSession/NewSessionAndOpen (the names are
             // accurate for the session list view; the code review view
@@ -451,8 +458,8 @@ pub fn render(
         Span::raw(" snap  "),
         Span::styled("tab", Style::default().fg(ACCENT)),
         Span::raw(" file  "),
-        Span::styled("r", Style::default().fg(ACCENT)),
-        Span::raw(" refresh  "),
+        Span::styled("?", Style::default().fg(ACCENT)),
+        Span::raw(" help  "),
         Span::styled("q", Style::default().fg(ACCENT)),
         Span::raw(" back"),
     ]);
@@ -460,6 +467,49 @@ pub fn render(
         Paragraph::new(status).style(Style::default().bg(STATUS_BG).fg(STATUS_FG)),
         chunks[3],
     );
+
+    if state.help_open {
+        render_help(f, area);
+    }
+}
+
+fn render_help(f: &mut Frame, area: ratatui::layout::Rect) {
+    use ratatui::layout::Rect;
+    use ratatui::widgets::{Clear, Wrap};
+    let popup_w = (area.width as i32 - 8).max(20) as u16;
+    let popup_h = 14u16.min(area.height.saturating_sub(4));
+    let x = (area.width.saturating_sub(popup_w)) / 2;
+    let y = (area.height.saturating_sub(popup_h)) / 2;
+    let popup = Rect::new(x, y, popup_w, popup_h);
+
+    f.render_widget(Clear, popup);
+
+    let body = "\
+Code review keys
+
+  j / k         scroll one line down / up
+  J / K         10-line jump (shift + j / k)
+  gg / G        top / bottom of the current snap
+  n / N         next / prev change row (no-op at boundary)
+  [ / ]         prev / next snap in the session
+  tab           next file's first snap
+  r             refresh from disk
+  ?             toggle this help
+  q / Esc       back to the session list
+
+Red rows show lines that were removed, with the
+prior text. Green rows show lines that were added.
+";
+    let paragraph = Paragraph::new(body)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(ACCENT))
+                .title(" help "),
+        )
+        .wrap(Wrap { trim: false })
+        .style(Style::default().fg(STATUS_FG));
+    f.render_widget(paragraph, popup);
 }
 
 fn sort_entries_by_time(entries: &mut [SnapEntry]) {

@@ -31,11 +31,13 @@ pub fn render(
     } else {
         state.scroll = 0;
     }
-    // Note: the line vec is the cached build (one per snap change, not
-    // per frame). The clone here is the per-frame cost ratatui needs to
-    // hand the Paragraph owned `Text`. The big perf win in this commit
-    // is the cached build; this clone is small relative to highlight
-    // work and only happens at 60fps.
+    // ratatui 0.26's `Text` only impls `From<Vec<Line<'a>>>` (owned), not
+    // `From<&'a [Line<'a>]>`, and `Paragraph` has no public way to give
+    // the text back. So we have to clone the cached `Vec<Line>` once per
+    // frame. The cached *build* (one per snap change, not per frame) is
+    // the dominant perf win in this module; the clone is the remaining
+    // per-frame cost, which is ~one Vec clone of `Line`s containing
+    // `Span`s containing `String`s — measurable but not the bottleneck.
     let mut paragraph = Paragraph::new(state.lines.clone())
         .scroll((state.scroll, 0))
         .wrap(Wrap { trim: false });

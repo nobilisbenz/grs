@@ -562,3 +562,42 @@ fn code_review_n_jumps_to_next_change_row() {
         "n at last change must no-op"
     );
 }
+
+#[test]
+fn code_review_help_toggles() {
+    use grs::tui::code_review::CodeReviewState;
+    use grs::tui::input::{KeyAction, VimParser};
+    let (_dir, store, session) = setup();
+    let mut state = CodeReviewState::load(store, session);
+    let mut parser = VimParser::new();
+    assert!(!state.help_open);
+    state.on_action(KeyAction::Help, &mut parser);
+    assert!(state.help_open);
+    state.on_action(KeyAction::Help, &mut parser);
+    assert!(!state.help_open);
+}
+
+#[test]
+fn code_review_help_renders_in_test_backend() {
+    use grs::tui::code_review::CodeReviewState;
+    use grs::tui::highlight::HighlightEngine;
+    let (_dir, store, session) = setup();
+    let mut state = CodeReviewState::load(store, session);
+    state.help_open = true;
+    let backend = TestBackend::new(140, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    let mut engine = HighlightEngine::new("base16-eighties.dark");
+    terminal
+        .draw(|f| grs::tui::code_review::render(f, &mut state, &mut engine))
+        .unwrap();
+    let buffer = terminal.backend().buffer().clone();
+    let text: String = buffer
+        .content
+        .iter()
+        .map(|c| c.symbol().chars().next().unwrap_or(' '))
+        .collect();
+    // The popup should appear and contain code-review-specific text.
+    assert!(text.contains("Code review keys"), "should show help popup");
+    assert!(text.contains("10-line jump"), "should mention 10-line jump");
+    assert!(text.contains("next / prev change"), "should mention n/N");
+}
