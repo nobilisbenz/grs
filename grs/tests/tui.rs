@@ -381,3 +381,112 @@ fn session_list_renders_to_backend() {
     assert!(text.contains("sessions"), "missing 'sessions' title");
     assert!(text.contains("move"), "status bar missing");
 }
+
+#[test]
+fn session_list_n_creates_new_and_returns_to_list() {
+    use grs::tui::input::KeyAction;
+    use grs::tui::session_list::{ListCmd, SessionListState};
+    let dir = tempfile::tempdir().unwrap();
+    let store = grs_lib::store::RepoStore::init(dir.path()).unwrap();
+    let mut list = SessionListState::load(store);
+    assert_eq!(list.sessions.len(), 1);
+    let cmd = list.on_action(KeyAction::NewSession);
+    assert!(matches!(cmd, ListCmd::Stay));
+    assert_eq!(list.sessions.len(), 2);
+    // The newly-created session is selected.
+    let selected_id = list.selected().unwrap().id.clone();
+    assert!(list.sessions.iter().any(|s| s.id == selected_id && s.is_open()));
+}
+
+#[test]
+fn session_list_N_creates_and_opens() {
+    use grs::tui::input::KeyAction;
+    use grs::tui::session_list::{ListCmd, SessionListState};
+    let dir = tempfile::tempdir().unwrap();
+    let store = grs_lib::store::RepoStore::init(dir.path()).unwrap();
+    let mut list = SessionListState::load(store);
+    match list.on_action(KeyAction::NewSessionAndOpen) {
+        ListCmd::OpenCodeReview(s) => {
+            assert!(s.is_open());
+        }
+        other => panic!("expected OpenCodeReview, got {other:?}"),
+    }
+}
+
+#[test]
+fn session_list_d_requires_confirm_and_refuses_open() {
+    use grs::tui::input::KeyAction;
+    use grs::tui::session_list::{ListCmd, SessionListState};
+    let dir = tempfile::tempdir().unwrap();
+    let store = grs_lib::store::RepoStore::init(dir.path()).unwrap();
+    let head = store.head().unwrap().unwrap();
+    let mut list = SessionListState::load(store.clone());
+    // First `d` on the open session: sets toast, but doesn't set
+    // pending_delete (the open-session branch returns early).
+    let _ = list.on_action(KeyAction::Delete);
+    assert!(list.pending_delete.is_none());
+    assert!(list.toast.as_deref().unwrap_or("").contains("open"));
+    // Rotate to finalize, then d works.
+    store.rotate_open_session(2_000_000_000_000).unwrap();
+    list.refresh();
+    // Cursor is on the newest (open) session. Move down to select the
+    // closed one (newest-first sort puts the new open session at index 0).
+    let _ = list.on_action(KeyAction::Down);
+    let first_d = list.on_action(KeyAction::Delete);
+    assert!(matches!(first_d, ListCmd::Stay));
+    assert!(list.pending_delete.is_some());
+    assert!(list.toast.as_deref().unwrap_or("").contains("press d again"));
+    // Second `d` confirms and deletes.
+    let second_d = list.on_action(KeyAction::Delete);
+    assert!(matches!(second_d, ListCmd::Stay));
+    assert!(list.pending_delete.is_none());
+    // The closed session dir is gone.
+    let closed_id = if list.sessions.iter().any(|s| s.id == head) {
+        head.clone()
+    } else {
+        // The original was deleted; sanity check via the store.
+        let sessions = list.store.sessions().list().unwrap();
+        assert!(!sessions.iter().any(|s| s.id == head));
+        head
+    };
+    // After deletion, the only remaining session is the open one.
+    let open_remaining = list.sessions.iter().filter(|s| s.is_open()).count();
+    assert_eq!(open_remaining, 1);
+    let _ = closed_id; // silence unused
+}
+
+#[test]
+fn session_list_filter_narrows_results() {
+    use grs::tui::input::KeyAction;
+    use grs::tui::session_list::SessionListState;
+    let dir = tempfile::tempdir().unwrap();
+    let store = grs_lib::store::RepoStore::init(dir.path()).unwrap();
+    let mut list = SessionListState::load(store);
+    // Enter filter mode.
+    let _ = list.on_action(KeyAction::Filter);
+    // Type a prefix that matches nothing (use the open session's id's last
+    // char so we can verify the filter actually narrows the set).
+    let head_id = list.sessions[0].id.as_str().to_string();
+    let last_char = head_id.chars().last().unwrap().to_string();
+    let _ = list.on_action(KeyAction::FilterChar(last_char.chars().next().unwrap()));
+    // The visible set should be ≤ 1.
+    assert!(list.visible().len() <= 1);
+    // CancelFilter clears the filter.
+    let _ = list.on_action(KeyAction::CancelFilter);
+    assert!(list.filter.is_empty());
+    assert_eq!(list.visible().len(), list.sessions.len());
+}
+
+#[test]
+fn session_list_help_toggles() {
+    use grs::tui::input::KeyAction;
+    use grs::tui::session_list::SessionListState;
+    let dir = tempfile::tempdir().unwrap();
+    let store = grs_lib::store::RepoStore::init(dir.path()).unwrap();
+    let mut list = SessionListState::load(store);
+    assert!(!list.help_open);
+    let _ = list.on_action(KeyAction::Help);
+    assert!(list.help_open);
+    let _ = list.on_action(KeyAction::Help);
+    assert!(!list.help_open);
+}

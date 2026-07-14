@@ -11,6 +11,8 @@ pub enum KeyState {
     PendingG,
     /// User pressed `:`; collecting digits until `Enter`/`Esc`.
     PendingColon(String),
+    /// User pressed `/`; collecting filter text until `Enter`/`Esc`.
+    PendingFilter(String),
 }
 
 /// Outcome of feeding a key.
@@ -43,11 +45,9 @@ pub enum KeyAction {
     GotoSnap(usize), // `:N<Enter>`
     TabFile,
     Refresh,
-    /// Show diff popup for the selected session (session list only).
-    ShowDiff,
     /// Toggle side-by-side (old | new) view (replay only).
     SideBySide,
-    Enter,     // session list -> open replay
+    Enter,     // session list -> open code review
     Filter,    // `/`
     ConfirmFilter, // Enter in filter mode
     CancelFilter,
@@ -55,6 +55,14 @@ pub enum KeyAction {
     FilterChar(char),
     /// Backspace in filter input.
     FilterBackspace,
+    /// Create a new session, return to the list with it selected (session list only).
+    NewSession,
+    /// Create a new session and immediately open it in the code review view.
+    NewSessionAndOpen,
+    /// Delete the selected session (session list only; requires a confirm step).
+    Delete,
+    /// Toggle the help overlay.
+    Help,
     /// No-op (unhandled).
     None,
 }
@@ -108,6 +116,32 @@ impl VimParser {
                 KeyCode::Char(c) if c.is_ascii_digit() => {
                     buf.push(c);
                     return KeyOutcome::Pending(self.state.clone());
+                }
+                _ => return KeyOutcome::Pending(self.state.clone()),
+            }
+        }
+
+        // Filter-input state: any char appends to the buffer (including
+        // digits, so we don't conflict with colon mode). Enter applies,
+        // Esc cancels and clears, Backspace pops.
+        if let KeyState::PendingFilter(ref mut buf) = self.state {
+            match key.code {
+                KeyCode::Esc => {
+                    buf.clear();
+                    self.reset();
+                    return KeyOutcome::Action(KeyAction::CancelFilter);
+                }
+                KeyCode::Enter => {
+                    self.reset();
+                    return KeyOutcome::Action(KeyAction::ConfirmFilter);
+                }
+                KeyCode::Backspace => {
+                    buf.pop();
+                    return KeyOutcome::Action(KeyAction::FilterBackspace);
+                }
+                KeyCode::Char(c) => {
+                    buf.push(c);
+                    return KeyOutcome::Action(KeyAction::FilterChar(c));
                 }
                 _ => return KeyOutcome::Pending(self.state.clone()),
             }
@@ -183,7 +217,19 @@ impl VimParser {
             }
             KeyCode::Char('d') => {
                 self.reset();
-                KeyOutcome::Action(KeyAction::ShowDiff)
+                KeyOutcome::Action(KeyAction::Delete)
+            }
+            KeyCode::Char('n') => {
+                self.reset();
+                KeyOutcome::Action(KeyAction::NewSession)
+            }
+            KeyCode::Char('N') => {
+                self.reset();
+                KeyOutcome::Action(KeyAction::NewSessionAndOpen)
+            }
+            KeyCode::Char('?') => {
+                self.reset();
+                KeyOutcome::Action(KeyAction::Help)
             }
             KeyCode::Char('s') => {
                 self.reset();
@@ -194,7 +240,9 @@ impl VimParser {
                 KeyOutcome::Action(KeyAction::Enter)
             }
             KeyCode::Char('/') => {
-                self.reset();
+                // Enter filter mode: any subsequent chars update the filter
+                // buffer (see PendingFilter handling above).
+                self.state = KeyState::PendingFilter(String::new());
                 KeyOutcome::Action(KeyAction::Filter)
             }
             _ => {

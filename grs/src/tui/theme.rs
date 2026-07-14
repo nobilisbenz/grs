@@ -10,3 +10,4 @@ pub const STATUS_BG: Color = Color::Rgb(20, 20, 30);
 pub const STATUS_FG: Color = Color::Rgb(200, 200, 200);
 pub const ACCENT: Color = Color::Rgb(100, 200, 255);
 pub const MUTED: Color = Color::Rgb(100, 100, 120);
+pub const WARNING: Color = Color::Rgb(255, 180, 80);
