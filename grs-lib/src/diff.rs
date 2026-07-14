@@ -3,7 +3,7 @@
 //! Uses `similar::TextDiff::from_lines` and inspects each `DiffOp`'s
 //! old/new ranges to derive 1-based line numbers of added/removed lines vs
 //! the previous content. The diff is computed once at snap time and stored
-//! in the snap JSON, so replay never diffs on the hot path (see `plan/02`).
+//! in the snap JSON, so the TUI never diffs on the hot path (see `plan/02`).
 
 use crate::model::LineDiff;
 use similar::{DiffTag, TextDiff};

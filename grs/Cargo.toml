@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "grs CLI/TUI: minimal replay timelapse for file edits"
+description = "grs CLI/TUI: code review over a session's file edits"
 
 [[bin]]
 name = "grs"

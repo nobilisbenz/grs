@@ -50,9 +50,8 @@ impl CommandHelper {
     }
 
     /// Open the store, auto-initializing the repo at the resolved root if it
-    /// doesn't exist yet. Used by the TUI entry points (`grs`, `grs tui`,
-    /// `grs replay`) so users can just start the TUI in any directory and
-    /// capture begins immediately.
+    /// doesn't exist yet. Used by the TUI entry point (`grs`) so users can
+    /// just start the TUI in any directory and capture begins immediately.
     pub fn store_or_init(&self) -> Result<RepoStore, GrsError> {
         if let Some(root) = &self.root {
             return RepoStore::open_or_init(root);

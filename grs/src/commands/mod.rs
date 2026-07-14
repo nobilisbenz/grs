@@ -18,7 +18,7 @@ pub mod new;
 #[command(
     name = "grs",
     version,
-    about = "Minimal replay timelapse for file edits",
+    about = "Code review over a session's file edits",
     long_about = None,
 )]
 pub struct Args {

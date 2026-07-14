@@ -3,7 +3,7 @@ source: grs/tests/snapshots.rs
 assertion_line: 8
 expression: help.to_string()
 ---
-Minimal replay timelapse for file edits
+Code review over a session's file edits
 
 Usage: grs [OPTIONS] [COMMAND]
 
