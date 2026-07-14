@@ -116,6 +116,10 @@ impl From<GrsError> for CommandError {
                 "grs storage version {v} is not supported by this build"
             ))
             .hinted("Upgrade grs."),
+            GrsError::SessionOpen(id) => CommandError::user_error(format!(
+                "session {id} is still open"
+            ))
+            .hinted("Run `grs new` to start a new session and close the current one first."),
             GrsError::Io(e) | GrsError::SnapIo(e) => {
                 CommandError::user_error_with_message("io error", e)
             }

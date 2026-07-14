@@ -35,7 +35,7 @@ pub fn run_replay(
     session: grs_lib::model::Session,
 ) -> Result<(), CommandError> {
     let _guard = watch::spawn(store.clone());
-    let engine = HighlightEngine::new(&store.config().replay.syntax_theme);
+    let engine = HighlightEngine::new(&store.config().tui.syntax_theme);
     let state = ReplayState::load(store, session);
     let mut terminal = setup_terminal().map_err(CommandError::internal_error)?;
     let result = replay_event_loop(&mut terminal, state, engine);

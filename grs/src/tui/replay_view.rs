@@ -67,7 +67,7 @@ impl ReplayState {
                 }
             }
         }
-        let speed_ms = store.config().replay.default_speed_ms.max(50);
+        let speed_ms = 600_u64.max(50);
         let mut s = Self {
             store,
             session,

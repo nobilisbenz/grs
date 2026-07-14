@@ -8,8 +8,6 @@ debounce_ms = 180
 # Extra ignore patterns appended to .grsignore.
 ignore_extra = []
 
-[replay]
-# Auto-advance delay (ms) when playing a session timelapse.
-default_speed_ms = 600
+[tui]
 # syntect theme name (must exist in the bundled ThemeSet).
 syntax_theme = "base16-eighties.dark"

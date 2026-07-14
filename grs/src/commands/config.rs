@@ -334,9 +334,9 @@ mod tests {
     #[test]
     fn set_string_value() {
         let mut doc = Config::default_toml().parse::<DocumentMut>().unwrap();
-        set_key(&mut doc, "replay.syntax_theme", "\"Dracula\"").unwrap();
+        set_key(&mut doc, "tui.syntax_theme", "\"Dracula\"").unwrap();
         let cfg: Config = toml::from_str(&doc.to_string()).unwrap();
-        assert_eq!(cfg.replay.syntax_theme, "Dracula");
+        assert_eq!(cfg.tui.syntax_theme, "Dracula");
     }
 
     #[test]

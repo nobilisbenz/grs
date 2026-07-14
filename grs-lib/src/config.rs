@@ -12,7 +12,7 @@ pub struct Config {
     #[serde(default)]
     pub watcher: WatcherConfig,
     #[serde(default)]
-    pub replay: ReplayConfig,
+    pub tui: TuiConfig,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -25,18 +25,13 @@ pub struct WatcherConfig {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ReplayConfig {
-    #[serde(default = "default_speed_ms")]
-    pub default_speed_ms: u64,
+pub struct TuiConfig {
     #[serde(default = "default_syntax_theme")]
     pub syntax_theme: String,
 }
 
 fn default_debounce_ms() -> u64 {
     180
-}
-fn default_speed_ms() -> u64 {
-    600
 }
 fn default_syntax_theme() -> String {
     "base16-eighties.dark".to_string()
@@ -51,10 +46,9 @@ impl Default for WatcherConfig {
     }
 }
 
-impl Default for ReplayConfig {
+impl Default for TuiConfig {
     fn default() -> Self {
         Self {
-            default_speed_ms: 600,
             syntax_theme: default_syntax_theme(),
         }
     }
@@ -104,18 +98,11 @@ impl Config {
                     other.watcher.ignore_extra
                 },
             },
-            replay: ReplayConfig {
-                default_speed_ms: if other.replay.default_speed_ms
-                    != ReplayConfig::default().default_speed_ms
-                {
-                    other.replay.default_speed_ms
+            tui: TuiConfig {
+                syntax_theme: if other.tui.syntax_theme == default_syntax_theme() {
+                    self.tui.syntax_theme
                 } else {
-                    self.replay.default_speed_ms
-                },
-                syntax_theme: if other.replay.syntax_theme == default_syntax_theme() {
-                    self.replay.syntax_theme
-                } else {
-                    other.replay.syntax_theme
+                    other.tui.syntax_theme
                 },
             },
         }
