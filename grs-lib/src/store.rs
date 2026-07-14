@@ -132,6 +132,30 @@ impl RepoStore {
         })?;
         self.sessions().get(&id)
     }
+
+    /// Finalize the current open session (if HEAD points to one) and create a
+    /// new open session, moving HEAD to it. Returns the new session.
+    ///
+    /// Behavior when HEAD is missing, points to a closed session, or is
+    /// otherwise invalid: the finalize step is skipped (silently — the prior
+    /// state is just abandoned) and a new session is created. This makes
+    /// `rotate_open_session` safe to call on a fresh or partially-initialized
+    /// repo. Tearing down the watcher and respawning it against the new
+    /// `RepoStore` is the caller's responsibility (see `tui/watch.rs`).
+    pub fn rotate_open_session(&self, now: Millis) -> Result<Session> {
+        if let Some(head_id) = self.head()? {
+            if let Ok(session) = self.sessions().get(&head_id) {
+                if session.is_open() {
+                    let (snap_count, file_count) = recompute_counts(self, &head_id)?;
+                    self.sessions()
+                        .finalize(&head_id, now, snap_count, file_count)?;
+                }
+            }
+        }
+        let new_session = self.sessions().create_new(now)?;
+        self.set_head(&new_session.id)?;
+        Ok(new_session)
+    }
 }
 
 /// Write a snap for a single file in the currently-open session. Used by
@@ -344,5 +368,58 @@ mod tests {
         let first = RepoStore::init(dir.path()).unwrap();
         let second = RepoStore::open_or_init(dir.path()).unwrap();
         assert_eq!(first.root(), second.root());
+    }
+
+    #[test]
+    fn rotate_open_session_finalizes_old_and_creates_new() {
+        let dir = tempdir().unwrap();
+        let store = RepoStore::init(dir.path()).unwrap();
+        let original = store.head().unwrap().expect("HEAD set after init");
+        // Write a snap into the original open session so finalize has counts.
+        write_file_snap(&store, &original, "a.txt", "a\n", None).unwrap();
+        let new = store.rotate_open_session(5000).unwrap();
+        assert_ne!(new.id, original);
+        assert!(new.is_open());
+        // HEAD now points at the new session.
+        assert_eq!(store.head().unwrap(), Some(new.id.clone()));
+        // The old session is finalized with the snap_count we wrote.
+        let finalized = store.sessions().get(&original).unwrap();
+        assert_eq!(finalized.ended_at, Some(5000));
+        assert_eq!(finalized.snap_count, 1);
+        assert_eq!(finalized.file_count, 1);
+        assert!(!finalized.is_open());
+    }
+
+    #[test]
+    fn rotate_open_session_when_head_already_closed() {
+        let dir = tempdir().unwrap();
+        let store = RepoStore::init(dir.path()).unwrap();
+        let first_head = store.head().unwrap().unwrap();
+        // First rotate: original open session gets finalized.
+        let new = store.rotate_open_session(1000).unwrap();
+        assert_eq!(store.head().unwrap(), Some(new.id.clone()));
+        // Second rotate: HEAD now points to the first-new (still open). It
+        // gets finalized; another new is created.
+        let new2 = store.rotate_open_session(2000).unwrap();
+        assert_eq!(store.head().unwrap(), Some(new2.id.clone()));
+        let middle = store.sessions().get(&new.id).unwrap();
+        assert!(!middle.is_open());
+        assert_eq!(middle.ended_at, Some(2000));
+        // Untouched: the original is still finalized from rotate #1.
+        let original = store.sessions().get(&first_head).unwrap();
+        assert_eq!(original.ended_at, Some(1000));
+    }
+
+    #[test]
+    fn rotate_open_session_with_missing_head() {
+        // No prior init: walk-up from cwd in an empty dir finds no .grs/, so
+        // we init fresh first, then explicitly nuke HEAD to simulate a
+        // missing/invalid HEAD scenario.
+        let dir = tempdir().unwrap();
+        let store = RepoStore::init(dir.path()).unwrap();
+        std::fs::write(store.paths().head.clone(), "").unwrap();
+        let new = store.rotate_open_session(1234).unwrap();
+        assert!(new.is_open());
+        assert_eq!(store.head().unwrap(), Some(new.id));
     }
 }
