@@ -36,6 +36,9 @@ pub enum GrsError {
 
     #[error("storage version {0} not supported by this grs build")]
     UnsupportedVersion(u32),
+
+    #[error("session {0} is open; close it (e.g. `grs new`) before deleting")]
+    SessionOpen(crate::ulid::SessionId),
 }
 
 pub type Result<T, E = GrsError> = std::result::Result<T, E>;

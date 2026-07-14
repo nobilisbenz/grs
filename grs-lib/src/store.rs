@@ -156,6 +156,26 @@ impl RepoStore {
         self.set_head(&new_session.id)?;
         Ok(new_session)
     }
+
+    /// Remove a session's directory (`sessions/<id>/`, including `meta.json`
+    /// and `snaps/`). Errors with `GrsError::NotFound` if the session doesn't
+    /// exist, and `GrsError::SessionOpen` if it's still open — callers
+    /// (CLI/TUI) are expected to surface a "close it first" hint. Does not
+    /// touch HEAD; because deletion is refused on open sessions, HEAD can
+    /// never point at a deleted session.
+    pub fn delete_session(&self, id: &SessionId) -> Result<()> {
+        let session = self.sessions().get(id).map_err(|_| {
+            GrsError::NotFound(format!("session {id}"))
+        })?;
+        if session.is_open() {
+            return Err(GrsError::SessionOpen(id.clone()));
+        }
+        let dir = self.paths.session_dir(id);
+        if dir.is_dir() {
+            std::fs::remove_dir_all(&dir)?;
+        }
+        Ok(())
+    }
 }
 
 /// Write a snap for a single file in the currently-open session. Used by
@@ -421,5 +441,41 @@ mod tests {
         let new = store.rotate_open_session(1234).unwrap();
         assert!(new.is_open());
         assert_eq!(store.head().unwrap(), Some(new.id));
+    }
+
+    #[test]
+    fn delete_session_removes_closed() {
+        let dir = tempdir().unwrap();
+        let store = RepoStore::init(dir.path()).unwrap();
+        let head = store.head().unwrap().unwrap();
+        // Write a snap, then rotate to finalize the open session.
+        write_file_snap(&store, &head, "a.txt", "a\n", None).unwrap();
+        store.rotate_open_session(1000).unwrap();
+        // The now-closed original session should be deletable.
+        let session_dir = store.paths().session_dir(&head);
+        assert!(session_dir.is_dir());
+        store.delete_session(&head).unwrap();
+        assert!(!session_dir.exists());
+        // Subsequent get / delete returns NotFound.
+        assert!(matches!(
+            store.sessions().get(&head).unwrap_err(),
+            GrsError::NotFound(_)
+        ));
+        assert!(matches!(
+            store.delete_session(&head).unwrap_err(),
+            GrsError::NotFound(_)
+        ));
+    }
+
+    #[test]
+    fn delete_session_refuses_open() {
+        let dir = tempdir().unwrap();
+        let store = RepoStore::init(dir.path()).unwrap();
+        let head = store.head().unwrap().unwrap();
+        // HEAD session is open after init — delete must refuse.
+        let err = store.delete_session(&head).unwrap_err();
+        assert!(matches!(err, GrsError::SessionOpen(ref id) if id == &head));
+        // The dir must still be there.
+        assert!(store.paths().session_dir(&head).is_dir());
     }
 }
