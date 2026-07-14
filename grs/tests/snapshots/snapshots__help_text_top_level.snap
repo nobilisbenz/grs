@@ -8,7 +8,6 @@ Minimal replay timelapse for file edits
 Usage: grs [OPTIONS] [COMMAND]
 
 Commands:
-  replay       Open the TUI replay timelapse for a session
   new          Finalize the current open session and start a new one
   completions  Generate a shell completion script (bash, zsh, fish, elvish, powershell)
   man          Generate a man page (roff) for the `grs` command

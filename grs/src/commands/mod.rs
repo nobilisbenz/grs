@@ -13,7 +13,6 @@ use crate::ui::Ui;
 pub mod completions;
 pub mod config;
 pub mod new;
-pub mod replay;
 
 #[derive(clap::Parser, Clone, Debug)]
 #[command(
@@ -31,8 +30,6 @@ pub struct Args {
 
 #[derive(clap::Subcommand, Clone, Debug)]
 pub enum Command {
-    /// Open the TUI replay timelapse for a session.
-    Replay(replay::ReplayArgs),
     /// Finalize the current open session and start a new one.
     New(new::NewArgs),
     /// Generate a shell completion script (bash, zsh, fish, elvish, powershell).
@@ -53,7 +50,6 @@ pub async fn run_command(ui: &mut Ui, command: &CommandHelper, args: &Args) -> R
         }
     };
     match cmd {
-        Command::Replay(a) => replay::cmd_replay(ui, command, a).await,
         Command::New(a) => new::cmd_new(ui, command, a).await,
         Command::Completions(a) => completions::cmd_completions(a),
         Command::Config(a) => config::cmd_config(ui, command, a).await,

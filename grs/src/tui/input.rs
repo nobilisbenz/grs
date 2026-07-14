@@ -9,8 +9,6 @@ pub enum KeyState {
     Idle,
     /// User pressed `g`; waiting for the second `g` of `gg`.
     PendingG,
-    /// User pressed `:`; collecting digits until `Enter`/`Esc`.
-    PendingColon(String),
     /// User pressed `/`; collecting filter text until `Enter`/`Esc`.
     PendingFilter(String),
 }
@@ -35,19 +33,21 @@ pub enum KeyAction {
     Up,
     Left,
     Right,
-    StepBack,  // `h` in replay
-    StepFwd,   // `l` in replay
-    PlayPause,
-    Faster,
-    Slower,
-    GotoFirst, // `gg`
-    GotoLast,  // `G`
-    GotoSnap(usize), // `:N<Enter>`
+    /// 10-line jump down (Shift+j).
+    JumpDown10,
+    /// 10-line jump up (Shift+k).
+    JumpUp10,
+    /// Viewport top of the current snap's content (`gg`).
+    GotoFirst,
+    /// Viewport bottom of the current snap's content (`G`).
+    GotoLast,
+    /// Jump to the previous snap in the session (`[`).
+    PrevSnap,
+    /// Jump to the next snap in the session (`]`).
+    NextSnap,
     TabFile,
     Refresh,
-    /// Toggle side-by-side (old | new) view (replay only).
-    SideBySide,
-    Enter,     // session list -> open code review
+    Enter,
     Filter,    // `/`
     ConfirmFilter, // Enter in filter mode
     CancelFilter,
@@ -55,9 +55,11 @@ pub enum KeyAction {
     FilterChar(char),
     /// Backspace in filter input.
     FilterBackspace,
-    /// Create a new session, return to the list with it selected (session list only).
+    /// `n`: in the session list, create a new session. In the code review
+    /// view, jump to the next change row. The view decides.
     NewSession,
-    /// Create a new session and immediately open it in the code review view.
+    /// `N`: in the session list, create a new session and open it. In the
+    /// code review view, jump to the previous change row.
     NewSessionAndOpen,
     /// Delete the selected session (session list only; requires a confirm step).
     Delete,
@@ -98,28 +100,6 @@ impl VimParser {
         }
 
         // Handle filter-input state first (we're typing into a buffer).
-        if let KeyState::PendingColon(ref mut buf) = self.state {
-            match key.code {
-                KeyCode::Esc => {
-                    self.reset();
-                    return KeyOutcome::Action(KeyAction::CancelFilter);
-                }
-                KeyCode::Enter => {
-                    let n: usize = buf.parse().unwrap_or(0);
-                    self.reset();
-                    return KeyOutcome::Action(KeyAction::GotoSnap(n));
-                }
-                KeyCode::Backspace => {
-                    buf.pop();
-                    return KeyOutcome::Pending(self.state.clone());
-                }
-                KeyCode::Char(c) if c.is_ascii_digit() => {
-                    buf.push(c);
-                    return KeyOutcome::Pending(self.state.clone());
-                }
-                _ => return KeyOutcome::Pending(self.state.clone()),
-            }
-        }
 
         // Filter-input state: any char appends to the buffer (including
         // digits, so we don't conflict with colon mode). Enter applies,
@@ -152,8 +132,8 @@ impl VimParser {
                 self.reset();
                 KeyOutcome::Action(KeyAction::Quit)
             }
-            KeyCode::Char('Q') | KeyCode::Char('i') => {
-                // Reserved: ignore
+            KeyCode::Char('Q') | KeyCode::Char('i') | KeyCode::Char('s') => {
+                // Reserved: ignore (s was side-by-side in the old replay)
                 self.reset();
                 KeyOutcome::Action(KeyAction::None)
             }
@@ -167,23 +147,27 @@ impl VimParser {
             }
             KeyCode::Char('h') | KeyCode::Left => {
                 self.reset();
-                KeyOutcome::Action(KeyAction::StepBack)
+                KeyOutcome::Action(KeyAction::Back)
             }
             KeyCode::Char('l') | KeyCode::Right => {
                 self.reset();
-                KeyOutcome::Action(KeyAction::StepFwd)
+                KeyOutcome::Action(KeyAction::Enter)
             }
-            KeyCode::Char(' ') => {
+            KeyCode::Char('J') => {
                 self.reset();
-                KeyOutcome::Action(KeyAction::PlayPause)
+                KeyOutcome::Action(KeyAction::JumpDown10)
             }
-            KeyCode::Char('+') | KeyCode::Char('=') => {
+            KeyCode::Char('K') => {
                 self.reset();
-                KeyOutcome::Action(KeyAction::Faster)
+                KeyOutcome::Action(KeyAction::JumpUp10)
             }
-            KeyCode::Char('-') | KeyCode::Char('_') => {
+            KeyCode::Char('[') => {
                 self.reset();
-                KeyOutcome::Action(KeyAction::Slower)
+                KeyOutcome::Action(KeyAction::PrevSnap)
+            }
+            KeyCode::Char(']') => {
+                self.reset();
+                KeyOutcome::Action(KeyAction::NextSnap)
             }
             KeyCode::Char('g') => match self.state {
                 KeyState::Idle => {
@@ -202,10 +186,6 @@ impl VimParser {
             KeyCode::Char('G') => {
                 self.reset();
                 KeyOutcome::Action(KeyAction::GotoLast)
-            }
-            KeyCode::Char(':') => {
-                self.state = KeyState::PendingColon(String::new());
-                KeyOutcome::Pending(self.state.clone())
             }
             KeyCode::Tab => {
                 self.reset();
@@ -230,10 +210,6 @@ impl VimParser {
             KeyCode::Char('?') => {
                 self.reset();
                 KeyOutcome::Action(KeyAction::Help)
-            }
-            KeyCode::Char('s') => {
-                self.reset();
-                KeyOutcome::Action(KeyAction::SideBySide)
             }
             KeyCode::Enter => {
                 self.reset();
@@ -269,22 +245,28 @@ mod tests {
     }
 
     #[test]
-    fn colon_digits_enter_jumps() {
-        let mut p = VimParser::new();
-        assert!(matches!(p.feed(k(':')), KeyOutcome::Pending(_)));
-        let _ = p.feed(k('1'));
-        let _ = p.feed(k('2'));
-        let outcome = p.feed(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        assert!(matches!(outcome, KeyOutcome::Action(KeyAction::GotoSnap(12))));
-    }
-
-    #[test]
     fn j_k_h_l() {
         let mut p = VimParser::new();
         assert!(matches!(p.feed(k('j')), KeyOutcome::Action(KeyAction::Down)));
         assert!(matches!(p.feed(k('k')), KeyOutcome::Action(KeyAction::Up)));
-        assert!(matches!(p.feed(k('h')), KeyOutcome::Action(KeyAction::StepBack)));
-        assert!(matches!(p.feed(k('l')), KeyOutcome::Action(KeyAction::StepFwd)));
+        // `h`/`l` are no longer bound to step actions; they go through the
+        // generic arm and return `None` (effectively a no-op for the view).
+        assert!(matches!(p.feed(k('h')), KeyOutcome::Action(KeyAction::Back)));
+        assert!(matches!(p.feed(k('l')), KeyOutcome::Action(KeyAction::Enter)));
+    }
+
+    #[test]
+    fn jk_caps_jump_10() {
+        let mut p = VimParser::new();
+        assert!(matches!(p.feed(k('J')), KeyOutcome::Action(KeyAction::JumpDown10)));
+        assert!(matches!(p.feed(k('K')), KeyOutcome::Action(KeyAction::JumpUp10)));
+    }
+
+    #[test]
+    fn brackets_step_snap() {
+        let mut p = VimParser::new();
+        assert!(matches!(p.feed(k('[')), KeyOutcome::Action(KeyAction::PrevSnap)));
+        assert!(matches!(p.feed(k(']')), KeyOutcome::Action(KeyAction::NextSnap)));
     }
 
     #[test]

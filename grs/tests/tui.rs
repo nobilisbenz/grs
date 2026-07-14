@@ -40,7 +40,7 @@ fn setup() -> (tempfile::TempDir, RepoStore, Session) {
 #[test]
 fn replay_state_loads_4_snaps_and_2_files() {
     let (_dir, store, session) = setup();
-    let replay = grs::tui::replay_view_for_test(store, session);
+    let mut replay = grs::tui::code_review_for_test(store, session);
     assert_eq!(replay.entries.len(), 4);
     assert_eq!(replay.files, vec!["a.py".to_string(), "b.py".to_string()]);
     assert_eq!(replay.cur_snap_idx, 0);
@@ -50,35 +50,45 @@ fn replay_state_loads_4_snaps_and_2_files() {
 #[test]
 fn step_forward_and_back() {
     let (_dir, store, session) = setup();
-    let mut replay = grs::tui::replay_view_for_test(store, session);
+    let mut replay = grs::tui::code_review_for_test(store, session);
     use grs::tui::input::{KeyAction, VimParser};
     let mut parser = VimParser::new();
-    replay.on_action(KeyAction::StepFwd, &mut parser);
+    replay.on_action(KeyAction::NextSnap, &mut parser);
     assert_eq!(replay.cur_snap_idx, 1);
-    replay.on_action(KeyAction::StepFwd, &mut parser);
+    replay.on_action(KeyAction::NextSnap, &mut parser);
     assert_eq!(replay.cur_snap_idx, 2);
-    replay.on_action(KeyAction::StepBack, &mut parser);
+    replay.on_action(KeyAction::PrevSnap, &mut parser);
     assert_eq!(replay.cur_snap_idx, 1);
 }
 
 #[test]
-fn goto_first_last_and_colon_jump() {
+fn goto_first_and_last_are_viewport_not_snap_jumps() {
+    // The shared-understanding semantic change: `gg`/`G` no longer jump
+    // between snaps. They scroll the *current* snap's content to top/
+    // bottom. Snap stepping is `[` / `]`.
     let (_dir, store, session) = setup();
-    let mut replay = grs::tui::replay_view_for_test(store, session);
+    let mut replay = grs::tui::code_review_for_test(store, session);
     use grs::tui::input::{KeyAction, VimParser};
     let mut parser = VimParser::new();
-    replay.on_action(KeyAction::GotoLast, &mut parser);
-    assert_eq!(replay.cur_snap_idx, 3);
+    // Scroll down so we can see the viewport jumps move it.
+    replay.file_view.scroll = 5;
     replay.on_action(KeyAction::GotoFirst, &mut parser);
+    assert_eq!(replay.file_view.scroll, 0);
+    assert_eq!(replay.cur_snap_idx, 0, "GotoFirst must not change snap index");
+    // GotoLast: scroll is set to u16::MAX; the render pass clamps it.
+    replay.on_action(KeyAction::GotoLast, &mut parser);
+    assert_eq!(replay.cur_snap_idx, 0, "GotoLast must not change snap index");
+    // NextSnap then PrevSnap navigate snaps.
+    replay.on_action(KeyAction::NextSnap, &mut parser);
+    assert_eq!(replay.cur_snap_idx, 1);
+    replay.on_action(KeyAction::PrevSnap, &mut parser);
     assert_eq!(replay.cur_snap_idx, 0);
-    replay.on_action(KeyAction::GotoSnap(3), &mut parser);
-    assert_eq!(replay.cur_snap_idx, 2); // 1-based
 }
 
 #[test]
 fn tab_cycles_files() {
     let (_dir, store, session) = setup();
-    let mut replay = grs::tui::replay_view_for_test(store, session);
+    let mut replay = grs::tui::code_review_for_test(store, session);
     use grs::tui::input::{KeyAction, VimParser};
     let mut parser = VimParser::new();
     assert_eq!(replay.current_snap.as_ref().unwrap().file_path, "a.py");
@@ -92,32 +102,19 @@ fn tab_cycles_files() {
 
 #[test]
 fn speed_up_and_slow_down() {
+    // The replay timelapse is gone; speed/play/pause have no analogue in
+    // the code review view. This test is a placeholder for future
+    // "scroll speed" features (e.g. configurable scroll-step for J/K).
+    // For now, the only motion controls are j/k (1 line) and J/K (10).
     let (_dir, store, session) = setup();
-    let mut replay = grs::tui::replay_view_for_test(store, session);
+    let mut replay = grs::tui::code_review_for_test(store, session);
     use grs::tui::input::{KeyAction, VimParser};
     let mut parser = VimParser::new();
-    let initial = replay.speed_ms;
-    replay.on_action(KeyAction::Faster, &mut parser);
-    assert!(replay.speed_ms < initial);
-    replay.on_action(KeyAction::Slower, &mut parser);
-    assert_eq!(replay.speed_ms, initial);
-}
-
-#[test]
-fn play_pause_advances_snaps() {
-    let (_dir, store, session) = setup();
-    let mut replay = grs::tui::replay_view_for_test(store, session);
-    use grs::tui::input::{KeyAction, VimParser};
-    let mut parser = VimParser::new();
-    replay.on_action(KeyAction::PlayPause, &mut parser);
-    assert!(replay.playing);
-    // Force a tick by rewinding last_tick.
-    replay.last_tick = std::time::Instant::now() - std::time::Duration::from_millis(10_000);
-    let moved = replay.tick();
-    assert!(moved);
-    assert_eq!(replay.cur_snap_idx, 1);
-    replay.on_action(KeyAction::PlayPause, &mut parser);
-    assert!(!replay.playing);
+    let initial = replay.file_view.scroll;
+    replay.on_action(KeyAction::JumpDown10, &mut parser);
+    assert!(replay.file_view.scroll > initial);
+    replay.on_action(KeyAction::JumpUp10, &mut parser);
+    assert_eq!(replay.file_view.scroll, initial);
 }
 
 #[test]
@@ -125,10 +122,10 @@ fn render_replay_with_test_backend() {
     let (_dir, store, session) = setup();
     let backend = TestBackend::new(120, 20);
     let mut terminal = Terminal::new(backend).unwrap();
-    let mut state = grs::tui::replay_view_for_test(store, session);
+    let mut state = grs::tui::code_review_for_test(store, session);
     let mut engine = grs::tui::highlight::HighlightEngine::new("base16-eighties.dark");
     terminal
-        .draw(|f| grs::tui::replay_view::render(f, &mut state, &mut engine))
+        .draw(|f| grs::tui::code_review::render(f, &mut state, &mut engine))
         .unwrap();
     let buffer = terminal.backend().buffer().clone();
     let text: String = buffer
@@ -136,56 +133,49 @@ fn render_replay_with_test_backend() {
         .iter()
         .map(|c| c.symbol().chars().next().unwrap_or(' '))
         .collect();
-    assert!(text.contains("replay"), "should show the replay header");
+    assert!(text.contains("code"), "should show the code header");
     assert!(text.contains("v1"), "should show snap content");
     assert!(text.contains("a.py"), "should show the file name");
 }
 
 #[test]
 fn side_by_side_toggle() {
-    let (_dir, store, session) = setup();
-    let mut replay = grs::tui::replay_view_for_test(store, session);
-    use grs::tui::input::{KeyAction, VimParser};
-    let mut parser = VimParser::new();
-
-    // Initially off.
-    assert!(!replay.side_by_side);
-    // Toggle on.
-    replay.on_action(KeyAction::SideBySide, &mut parser);
-    assert!(replay.side_by_side);
-    // Toggle off.
-    replay.on_action(KeyAction::SideBySide, &mut parser);
-    assert!(!replay.side_by_side);
+    // Side-by-side was removed: with the unified-diff render_snap (step 7)
+    // removed lines carry their prior text inline, so a side-by-side
+    // comparison is no longer needed. This test stays as a tombstone to
+    // document the removal.
+    let (_dir, _store, _session) = setup();
 }
 
 #[test]
 fn prev_snap_is_loaded_when_stepping() {
     let (_dir, store, session) = setup();
-    let mut replay = grs::tui::replay_view_for_test(store, session);
+    let mut replay = grs::tui::code_review_for_test(store, session);
     use grs::tui::input::{KeyAction, VimParser};
     let mut parser = VimParser::new();
     // First snap has no prev_seq (prev_snap should be None).
     assert!(replay.prev_snap.is_none());
     // Step forward to snap 1 — its prev_seq is 0, so prev_snap should be loaded.
-    replay.on_action(KeyAction::StepFwd, &mut parser);
+    replay.on_action(KeyAction::NextSnap, &mut parser);
     assert!(replay.prev_snap.is_some());
     assert_eq!(replay.prev_snap.as_ref().unwrap().file_path, "a.py");
 }
 
 #[test]
-fn side_by_side_renders_both_panes() {
+fn code_review_renders_current_snap_content() {
+    // The old side-by-side test is replaced by a single-pane test that
+    // verifies the code review view shows the *current* snap's content.
     let (_dir, store, session) = setup();
-    let mut replay = grs::tui::replay_view_for_test(store, session);
+    let mut replay = grs::tui::code_review_for_test(store, session);
     use grs::tui::input::{KeyAction, VimParser};
     let mut parser = VimParser::new();
     // Step to a snap that has a prev.
-    replay.on_action(KeyAction::StepFwd, &mut parser);
-    replay.side_by_side = true;
+    replay.on_action(KeyAction::NextSnap, &mut parser);
     let backend = TestBackend::new(160, 20);
     let mut terminal = Terminal::new(backend).unwrap();
     let mut engine = grs::tui::highlight::HighlightEngine::new("base16-eighties.dark");
     terminal
-        .draw(|f| grs::tui::replay_view::render(f, &mut replay, &mut engine))
+        .draw(|f| grs::tui::code_review::render(f, &mut replay, &mut engine))
         .unwrap();
     let buffer = terminal.backend().buffer().clone();
     let text: String = buffer
@@ -193,9 +183,10 @@ fn side_by_side_renders_both_panes() {
         .iter()
         .map(|c| c.symbol().chars().next().unwrap_or(' '))
         .collect();
-    // Both pane titles should be present.
-    assert!(text.contains("prev"), "should show prev pane title");
-    assert!(text.contains("current"), "should show current pane title");
+    // The header + file path + snap content should all be present.
+    assert!(text.contains("code"), "should show the code header");
+    assert!(text.contains("a.py"), "should show the file name");
+    assert!(text.contains("v1"), "should show snap content");
 }
 
 #[test]
@@ -203,10 +194,10 @@ fn render_replay_shows_line_numbers() {
     let (_dir, store, session) = setup();
     let backend = TestBackend::new(120, 20);
     let mut terminal = Terminal::new(backend).unwrap();
-    let mut state = grs::tui::replay_view_for_test(store, session);
+    let mut state = grs::tui::code_review_for_test(store, session);
     let mut engine = grs::tui::highlight::HighlightEngine::new("base16-eighties.dark");
     terminal
-        .draw(|f| grs::tui::replay_view::render(f, &mut state, &mut engine))
+        .draw(|f| grs::tui::code_review::render(f, &mut state, &mut engine))
         .unwrap();
     let buffer = terminal.backend().buffer().clone();
     let text: String = buffer
@@ -257,15 +248,11 @@ fn entries_are_sorted_by_time_not_seq() {
         file_count: 2,
         snap_count: 3,
     };
-    let replay = grs::tui::replay_view_for_test(store, session);
+    let mut replay = grs::tui::code_review_for_test(store, session);
     let order: Vec<String> = replay
         .entries
         .iter()
-        .map(|e| {
-            SnapStore::read_path(&e.path)
-                .unwrap()
-                .file_path
-        })
+        .map(|e| SnapStore::read_path(&e.path).unwrap().file_path)
         .collect();
     assert_eq!(
         order,
@@ -277,11 +264,11 @@ fn entries_are_sorted_by_time_not_seq() {
 #[test]
 fn periodic_refresh_does_not_reset_scroll() {
     let (_dir, store, session) = setup();
-    let mut replay = grs::tui::replay_view_for_test(store, session);
+    let mut replay = grs::tui::code_review_for_test(store, session);
     use grs::tui::input::{KeyAction, VimParser};
     let mut parser = VimParser::new();
     // Step to snap 1 (so we have something to look at).
-    replay.on_action(KeyAction::StepFwd, &mut parser);
+    replay.on_action(KeyAction::NextSnap, &mut parser);
     // Scroll down a few lines.
     replay.file_view.scroll = 7;
     let before = replay.file_view.scroll;
@@ -295,7 +282,7 @@ fn periodic_refresh_does_not_reset_scroll() {
 
     // But stepping to a new snap *should* reset scroll — that's the
     // documented behaviour and is what the user expects.
-    replay.on_action(KeyAction::StepFwd, &mut parser);
+    replay.on_action(KeyAction::NextSnap, &mut parser);
     assert_eq!(replay.file_view.scroll, 0);
 }
 
