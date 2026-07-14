@@ -238,12 +238,58 @@ impl CodeReviewState {
                 CodeReviewCmd::Stay
             }
             KeyAction::Quit | KeyAction::Back => CodeReviewCmd::Pop,
-            // n/N for next/prev change: implemented in step 7 once
-            // render_snap's unified-diff output is available.
-            KeyAction::NewSession | KeyAction::NewSessionAndOpen => CodeReviewCmd::Stay,
+            // n/N: next/prev change row in the current snap. The parser
+            // emits these as NewSession/NewSessionAndOpen (the names are
+            // accurate for the session list view; the code review view
+            // reinterprets them). No-op at the boundary (no status change).
+            KeyAction::NewSession => {
+                self.file_view.scroll = jump_to_change(
+                    &self.file_view.lines,
+                    self.file_view.scroll,
+                    true,
+                );
+                CodeReviewCmd::Stay
+            }
+            KeyAction::NewSessionAndOpen => {
+                self.file_view.scroll = jump_to_change(
+                    &self.file_view.lines,
+                    self.file_view.scroll,
+                    false,
+                );
+                CodeReviewCmd::Stay
+            }
             _ => CodeReviewCmd::Stay,
         }
     }
+}
+
+/// Find the next (or previous) change row in `lines` relative to `cur`,
+/// and set `file_view.scroll` so that row is at the top of the viewport.
+/// Change rows are any with a non-default background style (added or
+/// removed). At the boundary: no-op.
+fn jump_to_change(lines: &[ratatui::text::Line<'_>], cur: u16, forward: bool) -> u16 {
+    use ratatui::style::Color;
+    let is_change = |l: &ratatui::text::Line<'_>| -> bool {
+        matches!(l.style.bg, Some(c) if c != Color::Reset)
+    };
+    if forward {
+        if let Some((i, _)) = lines
+            .iter()
+            .enumerate()
+            .skip((cur as usize) + 1)
+            .find(|(_, l)| is_change(l))
+        {
+            return i as u16;
+        }
+    } else {
+        let cur_us = cur as usize;
+        for i in (0..cur_us).rev() {
+            if is_change(&lines[i]) {
+                return i as u16;
+            }
+        }
+    }
+    cur
 }
 
 pub fn render(
@@ -300,14 +346,16 @@ pub fn render(
     // File content
     let file_area = chunks[2];
     if let Some(snap) = state.current_snap.clone() {
-        let lines = render_snap(
-            engine,
-            &snap.content,
-            &snap.file_path,
-            &snap.diff.added_lines,
-            &snap.diff.removed_lines,
-            true,
-        );
+        // Source the prior text from `prev_snap` (same file, previous
+        // sequence) so removed lines can render with their actual content.
+        // First snap of a file has no prev; treat as empty prev.
+        let prev_content = state
+            .prev_snap
+            .as_ref()
+            .filter(|p| p.file_path == snap.file_path)
+            .map(|p| p.content.as_str())
+            .unwrap_or("");
+        let lines = render_snap(engine, prev_content, &snap.content, &snap.file_path, true);
         state.file_view.lines = lines;
         file_view::render(
             f,

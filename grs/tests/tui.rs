@@ -477,3 +477,88 @@ fn session_list_help_toggles() {
     let _ = list.on_action(KeyAction::Help);
     assert!(!list.help_open);
 }
+
+#[test]
+fn code_review_n_jumps_to_next_change_row() {
+    use grs::tui::code_review::CodeReviewState;
+    use grs::tui::highlight::HighlightEngine;
+    use grs::tui::input::{KeyAction, VimParser};
+    use grs_lib::diff::line_diff;
+    use grs_lib::snap::SnapStore;
+    let dir = tempfile::tempdir().unwrap();
+    let store = RepoStore::init(dir.path()).unwrap();
+    let head = store.head().unwrap().unwrap();
+    let snap_store = store.snaps();
+    // First snap: original content.
+    snap_store
+        .write(
+            &head,
+            SnapStore::build_snap(
+                0,
+                "x.py".into(),
+                "a\nb\nc\nd\n".into(),
+                line_diff("", "a\nb\nc\nd\n"),
+                None,
+            ),
+        )
+        .unwrap();
+    // Second snap: replace 'b' with 'X' and 'c' with 'Y' (a Replace of
+    // 2 old + 2 new), plus append 'e' (an Insert of 1).
+    snap_store
+        .write(
+            &head,
+            SnapStore::build_snap(
+                1,
+                "x.py".into(),
+                "a\nX\nY\nd\ne\n".into(),
+                line_diff("a\nb\nc\nd\n", "a\nX\nY\nd\ne\n"),
+                Some(0),
+            ),
+        )
+        .unwrap();
+    let session = store.sessions().get(&head).unwrap();
+    let mut state = CodeReviewState::load(store, session);
+    let mut engine = HighlightEngine::new("base16-eighties.dark");
+    // Force a render so file_view.lines is populated.
+    let backend = TestBackend::new(120, 20);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal
+        .draw(|f| grs::tui::code_review::render(f, &mut state, &mut engine))
+        .unwrap();
+    let mut parser = VimParser::new();
+    // Step to snap 1 (the one with changes).
+    state.on_action(KeyAction::NextSnap, &mut parser);
+    // Re-render to populate the lines for snap 1.
+    terminal
+        .draw(|f| grs::tui::code_review::render(f, &mut state, &mut engine))
+        .unwrap();
+    // The change rows are at indices 1, 2 (Delete) and 3, 4 (Insert); also
+    // index 5 (the new 'e' line). Equal rows are at 0 (a) and (last) (d).
+    let lines = state.file_view.lines.clone();
+    let change_indices: Vec<usize> = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| l.style.bg.is_some())
+        .map(|(i, _)| i)
+        .collect();
+    assert!(
+        change_indices.len() >= 3,
+        "expected at least 3 change rows in the unified diff, got {change_indices:?}"
+    );
+    // n: jump to the first change.
+    state.on_action(KeyAction::NewSession, &mut parser);
+    assert_eq!(state.file_view.scroll as usize, change_indices[0]);
+    // Keep pressing n until we reach the last change row.
+    for _ in 0..change_indices.len() {
+        state.on_action(KeyAction::NewSession, &mut parser);
+    }
+    let last_change = *change_indices.last().unwrap() as u16;
+    assert_eq!(state.file_view.scroll, last_change, "should land on the last change row");
+    // n at the last change: no-op.
+    state.on_action(KeyAction::NewSession, &mut parser);
+    assert_eq!(
+        state.file_view.scroll,
+        last_change,
+        "n at last change must no-op"
+    );
+}

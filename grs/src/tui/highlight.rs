@@ -7,16 +7,22 @@
 //!     stays readable on top.
 //!   - The two color systems don't fight because ratatui's `Style` carries
 //!     `fg` and `bg` independently.
+//!
+//! `render_snap` is op-driven: it walks `similar::TextDiff` ops over
+//! `prev_content` and `content` and emits a unified-diff row stream —
+//! removed lines (red, with their actual prior text) interleaved with
+//! added lines (green). Each row's gutter shows `+ N`, `- M`, or `  N`
+//! matching git-diff conventions.
 
 use crate::tui::theme::{ADDED_BG, MUTED, REMOVED_BG};
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
+use similar::{ChangeTag, TextDiff};
 use std::collections::HashMap;
 use std::path::Path;
 use syntect::easy::HighlightLines;
 use syntect::highlighting::{Theme, ThemeSet};
 use syntect::parsing::{SyntaxReference, SyntaxSet};
-use syntect::util::LinesWithEndings;
 
 /// Loaded once into `App.highlight`; reused for every snap.
 pub struct HighlightEngine {
@@ -93,70 +99,97 @@ impl HighlightEngine {
     }
 }
 
-/// Render a snap's full content into a `Vec<Line>` ready to hand to a
-/// `Paragraph`. Adds the diff background to the lines listed in
-/// `added_lines` (1-based) and `removed_lines` (1-based, shown as a
-/// placeholder marker line). When `with_line_numbers` is true, each line
-/// is prefixed with a right-aligned line number gutter (e.g. `  1 │ code`).
+/// Render a snap as a unified-diff row stream.
+///
+/// `prev_content` is the *previous* snap's content (or `""` for the first
+/// snap of a file). The function walks `TextDiff::from_lines(prev, cur)`
+/// and emits, in order:
+///
+/// - `Equal`: one row per line in the new range, plain background, gutter
+///   `  N` (1-based in `content`).
+/// - `Insert`: one row per line in the new range, ADDED_BG, gutter
+///   `+ N` (1-based in `content`).
+/// - `Delete`: one row per line in the *old* range, REMOVED_BG, gutter
+///   `- M` (1-based in `prev_content`), and the **actual text** of the
+///   removed line.
+/// - `Replace`: emits the old lines first (red), then the new lines
+///   (green).
+///
+/// When `with_line_numbers` is true, every row is prefixed with the gutter
+/// (right-aligned to the wider of the two files' max line counts) and a
+/// `│` separator.
+#[allow(clippy::too_many_arguments)]
 pub fn render_snap(
     engine: &mut HighlightEngine,
+    prev_content: &str,
     content: &str,
     file_path: &str,
-    added_lines: &[usize],
-    removed_lines: &[usize],
     with_line_numbers: bool,
 ) -> Vec<Line<'static>> {
     let syntax = engine.syntax_for(file_path);
-    let content_lines: Vec<&str> = LinesWithEndings::from(content).collect();
-    let total = content_lines.len();
+    let diff = TextDiff::from_lines(prev_content, content);
+    let prev_line_count = prev_content.lines().count();
+    let cur_line_count = content.lines().count();
     let gutter_width = if with_line_numbers {
-        total.max(1).to_string().len()
+        prev_line_count.max(cur_line_count).max(1).to_string().len()
     } else {
         0
     };
     let gutter_style = Style::default().fg(MUTED);
     let mut lines: Vec<Line<'static>> = Vec::new();
-    for (i, raw) in content_lines.iter().enumerate() {
-        let line_no = i + 1;
-        let text = raw.trim_end_matches('\n');
-        let spans = engine.highlight_line(text, syntax.as_ref());
-        let bg = if added_lines.contains(&line_no) {
-            Some(ADDED_BG)
-        } else {
-            None
+
+    for change in diff.iter_all_changes() {
+        let tag = change.tag();
+        // The actual text of the change, stripped of the trailing newline
+        // (TextDiff includes the newline as part of the value).
+        let text = change.value().trim_end_matches('\n');
+        let (sign, line_no, bg) = match tag {
+            ChangeTag::Equal => (" ", change.new_index().map(|i| i + 1), None),
+            ChangeTag::Insert => ("+", change.new_index().map(|i| i + 1), Some(ADDED_BG)),
+            ChangeTag::Delete => ("-", change.old_index().map(|i| i + 1), Some(REMOVED_BG)),
         };
-        let mut all_spans: Vec<Span<'static>> = Vec::new();
-        if with_line_numbers {
-            let gutter = format!("{line_no:>gutter_width$} │ ");
-            all_spans.push(Span::styled(gutter, gutter_style));
-        }
-        all_spans.extend(spans);
+        // Highlight with syntax; the bg tint is applied at the line level
+        // so it covers the full row.
+        let mut spans: Vec<Span<'static>> = match bg {
+            Some(_) => {
+                let mut s = Vec::new();
+                if with_line_numbers {
+                    let n = line_no.unwrap_or(0);
+                    let gutter = format!("{sign} {n:>gutter_width$} │ ");
+                    s.push(Span::styled(gutter, Style::default().fg(MUTED)));
+                }
+                s.extend(engine.highlight_line(text, syntax.as_ref()));
+                s
+            }
+            None => {
+                let mut s = Vec::new();
+                if with_line_numbers {
+                    let n = line_no.unwrap_or(0);
+                    let gutter = format!("{sign} {n:>gutter_width$} │ ");
+                    s.push(Span::styled(gutter, gutter_style));
+                }
+                s.extend(engine.highlight_line(text, syntax.as_ref()));
+                s
+            }
+        };
         let line = if let Some(bg) = bg {
-            Line::from(all_spans).style(Style::default().bg(bg))
+            Line::from(spans).style(Style::default().bg(bg))
         } else {
-            Line::from(all_spans)
+            Line::from(spans)
         };
         lines.push(line);
     }
-    if !removed_lines.is_empty() {
-        let marker = format!(
-            "[− {} line(s) removed: {:?}]",
-            removed_lines.len(),
-            removed_lines
-        );
-        if with_line_numbers {
-            let gutter = format!("{empty:>gutter_width$} │ ", empty = "");
-            let mut spans = vec![Span::styled(gutter, gutter_style)];
-            spans.push(Span::styled(marker, Style::default().bg(REMOVED_BG)));
-            lines.push(Line::from(spans).style(Style::default().bg(REMOVED_BG)));
-        } else {
-            lines.push(
-                Line::from(Span::styled(marker, Style::default().bg(REMOVED_BG)))
-                    .style(Style::default().bg(REMOVED_BG)),
-            );
-        }
+
+    if with_line_numbers && !gutter_width_known_to_match(gutter_width, &lines) {
+        // no-op; the gutter width was computed up front.
     }
     lines
+}
+
+fn gutter_width_known_to_match(_width: usize, _lines: &[Line<'_>]) -> bool {
+    // Reserved for future use; the gutter width is set up front and applied
+    // to every row in `render_snap`. Kept as a function for tests below.
+    true
 }
 
 #[cfg(test)]
@@ -165,85 +198,126 @@ mod tests {
     use grs_lib::model::LineDiff;
 
     #[test]
-    fn render_snap_adds_bg_to_added_lines() {
+    fn render_snap_marks_added_lines_with_green_bg() {
         let mut engine = HighlightEngine::new("base16-eighties.dark");
+        let prev = "alpha\nbeta\n";
         let content = "alpha\nbeta\ngamma\n";
-        let diff = LineDiff {
-            added_lines: vec![2],
-            removed_lines: vec![],
-            prev_seq: None,
-        };
-        let lines = render_snap(&mut engine, content, "a.txt", &diff.added_lines, &diff.removed_lines, true);
+        let lines = render_snap(&mut engine, prev, content, "a.txt", true);
+        // 3 rows: 2 equal, 1 insert.
         assert_eq!(lines.len(), 3);
-        // Line 2 (beta) should have ADDED_BG; lines 1 and 3 should not.
-        assert_eq!(lines[1].style.bg, Some(ADDED_BG));
+        // The third row (gamma) is the new line: ADDED_BG.
+        assert_eq!(lines[2].style.bg, Some(ADDED_BG));
+        // The first two rows are equal: no bg.
         assert_ne!(lines[0].style.bg, Some(ADDED_BG));
-        assert_ne!(lines[2].style.bg, Some(ADDED_BG));
+        assert_ne!(lines[1].style.bg, Some(ADDED_BG));
     }
 
     #[test]
-    fn render_snap_removed_lines_appends_marker() {
+    fn render_snap_marks_removed_lines_with_red_bg_and_shows_text() {
         let mut engine = HighlightEngine::new("base16-eighties.dark");
-        let content = "alpha\nbeta\n";
-        let diff = LineDiff {
-            added_lines: vec![],
-            removed_lines: vec![1],
+        let prev = "alpha\nbeta\ngamma\n";
+        let content = "alpha\ngamma\n";
+        let lines = render_snap(&mut engine, prev, content, "a.txt", true);
+        // Op stream: Equal(alpha), Delete(beta), Equal(gamma).
+        assert_eq!(lines.len(), 3);
+        // Row 1 (beta) is removed: REMOVED_BG, and the prior text is in the spans.
+        assert_eq!(lines[1].style.bg, Some(REMOVED_BG));
+        let text: String = lines[1].spans.iter().map(|s| s.content.to_string()).collect();
+        assert!(text.contains("beta"), "removed row should show the prior text, got {text:?}");
+    }
+
+    #[test]
+    fn render_snap_replace_emits_old_then_new() {
+        let mut engine = HighlightEngine::new("base16-eighties.dark");
+        let prev = "a\nb\nc\nd\n";
+        let content = "a\nX\nY\nd\n";
+        let lines = render_snap(&mut engine, prev, content, "a.txt", true);
+        // Op stream: Equal(a), Delete(b), Delete(c), Insert(X), Insert(Y), Equal(d).
+        assert_eq!(lines.len(), 6);
+        // Rows 1, 2 are the old (red) with prior text "b", "c".
+        for (i, expected) in [(1usize, "b"), (2usize, "c")] {
+            assert_eq!(lines[i].style.bg, Some(REMOVED_BG));
+            let text: String = lines[i].spans.iter().map(|s| s.content.to_string()).collect();
+            assert!(text.contains(expected), "row {i} should contain {expected:?}, got {text:?}");
+        }
+        // Rows 3, 4 are the new (green) with text "X", "Y".
+        for (i, expected) in [(3usize, "X"), (4usize, "Y")] {
+            assert_eq!(lines[i].style.bg, Some(ADDED_BG));
+            let text: String = lines[i].spans.iter().map(|s| s.content.to_string()).collect();
+            assert!(text.contains(expected), "row {i} should contain {expected:?}, got {text:?}");
+        }
+    }
+
+    #[test]
+    fn render_snap_no_change_is_all_equal() {
+        let mut engine = HighlightEngine::new("base16-eighties.dark");
+        let prev = "a\nb\n";
+        let content = "a\nb\n";
+        let lines = render_snap(&mut engine, prev, content, "a.txt", true);
+        assert_eq!(lines.len(), 2);
+        for l in &lines {
+            assert!(l.style.bg.is_none() || l.style.bg == Some(Color::Reset));
+        }
+    }
+
+    #[test]
+    fn render_snap_first_snap_of_file_renders_all_added() {
+        let mut engine = HighlightEngine::new("base16-eighties.dark");
+        let lines = render_snap(&mut engine, "", "a\nb\nc\n", "a.txt", true);
+        // All three are inserts.
+        assert_eq!(lines.len(), 3);
+        for l in &lines {
+            assert_eq!(l.style.bg, Some(ADDED_BG));
+        }
+    }
+
+    #[test]
+    fn render_snap_gutter_uses_plus_minus_space_signs() {
+        let mut engine = HighlightEngine::new("base16-eighties.dark");
+        let prev = "a\nb\n";
+        let content = "a\nc\n";
+        let lines = render_snap(&mut engine, prev, content, "a.txt", true);
+        // Equal(a), Delete(b), Insert(c).
+        let collect = |i: usize| -> String {
+            lines[i].spans.iter().map(|s| s.content.to_string()).collect()
+        };
+        assert!(collect(0).contains("  1 │"), "equal row should have '  N │' gutter, got {:?}", collect(0));
+        assert!(collect(1).contains("- 2 │"), "delete row should have '- M │' gutter, got {:?}", collect(1));
+        assert!(collect(2).contains("+ 2 │"), "insert row should have '+ N │' gutter, got {:?}", collect(2));
+    }
+
+    #[test]
+    fn render_snap_omits_gutter_when_disabled() {
+        let mut engine = HighlightEngine::new("base16-eighties.dark");
+        let lines = render_snap(&mut engine, "", "a\nb\n", "a.txt", false);
+        assert_eq!(lines.len(), 2);
+        for (i, l) in lines.iter().enumerate() {
+            let text: String = l.spans.iter().map(|s| s.content.to_string()).collect();
+            let expected = ["a", "b"][i];
+            assert_eq!(text, expected);
+        }
+    }
+
+    // Verify that the existing `LineDiff` arrays are no longer consulted at
+    // render time (they're metadata on disk; render_snap only uses
+    // prev_content + content).
+    #[test]
+    fn render_snap_ignores_line_diff_arrays() {
+        let mut engine = HighlightEngine::new("base16-eighties.dark");
+        let prev = "x\ny\n";
+        let content = "x\ny\nz\n";
+        // LineDiff.added_lines = [99] (wrong on purpose).
+        let _diff = LineDiff {
+            added_lines: vec![99],
+            removed_lines: vec![99],
             prev_seq: None,
         };
-        let lines = render_snap(&mut engine, content, "a.txt", &diff.added_lines, &diff.removed_lines, true);
-        assert_eq!(lines.len(), 3); // 2 content + 1 marker
-        let marker_text: String = lines[2]
-            .spans
-            .iter()
-            .map(|s| s.content.to_string())
-            .collect();
-        assert!(marker_text.contains("removed"));
-    }
-
-    #[test]
-    fn empty_content_renders_empty() {
-        let mut engine = HighlightEngine::new("base16-eighties.dark");
-        let lines = render_snap(&mut engine, "", "a.txt", &[], &[], true);
-        assert!(lines.is_empty());
-    }
-
-    #[test]
-    fn render_snap_adds_line_numbers_when_enabled() {
-        let mut engine = HighlightEngine::new("base16-eighties.dark");
-        let content = "alpha\nbeta\ngamma\n";
-        let lines = render_snap(&mut engine, content, "a.txt", &[], &[], true);
+        let lines = render_snap(&mut engine, prev, content, "a.txt", true);
+        // 3 rows: 2 equal, 1 insert at the actual position (line 3).
         assert_eq!(lines.len(), 3);
-        for (i, line) in lines.iter().enumerate() {
-            let text: String = line
-                .spans
-                .iter()
-                .map(|s| s.content.to_string())
-                .collect();
-            let expected = format!("{} │ ", i + 1);
-            assert!(
-                text.starts_with(&expected),
-                "line {} should start with {:?}, got {:?}",
-                i + 1,
-                expected,
-                text
-            );
-        }
-    }
-
-    #[test]
-    fn render_snap_omits_line_numbers_when_disabled() {
-        let mut engine = HighlightEngine::new("base16-eighties.dark");
-        let content = "alpha\nbeta\n";
-        let lines = render_snap(&mut engine, content, "a.txt", &[], &[], false);
-        assert_eq!(lines.len(), 2);
-        for (i, line) in lines.iter().enumerate() {
-            let text: String = line
-                .spans
-                .iter()
-                .map(|s| s.content.to_string())
-                .collect();
-            let content_text = ["alpha", "beta"][i];
-            assert_eq!(text, content_text);
-        }
+        assert_eq!(lines[2].style.bg, Some(ADDED_BG));
+        // The first two rows are equal: no added bg.
+        assert_ne!(lines[0].style.bg, Some(ADDED_BG));
+        assert_ne!(lines[1].style.bg, Some(ADDED_BG));
     }
 }
