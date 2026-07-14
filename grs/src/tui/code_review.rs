@@ -21,7 +21,6 @@
 //! repurposes them to next/prev-change-row jumps.
 
 use crate::tui::file_view::{self, FileViewState};
-use crate::tui::highlight::render_snap;
 use crate::tui::highlight::HighlightEngine;
 use crate::tui::input::{KeyAction, VimParser};
 use crate::tui::theme::{ACCENT, MUTED, SCRUBBER_BG, STATUS_BG, STATUS_FG};
@@ -62,11 +61,19 @@ pub struct CodeReviewState {
     /// one of that file — used by `tab` to jump to a file's first snap.
     pub file_first_idx: Vec<usize>,
     pub file_view: FileViewState,
+    /// Cached rendered lines for `current_snap` (built once per snap, reused
+    /// on every frame). When `None`, the view is empty. Built by
+    /// `refresh_current` whenever the snap actually changes; never rebuilt
+    /// on a no-op `refresh()`.
+    pub cached_lines: Option<Vec<ratatui::text::Line<'static>>>,
     /// Seq of the last snap we actually loaded into `current_snap`. Used to
     /// detect *real* snap changes (vs. the periodic `refresh()` from the
     /// TUI's tick) so we don't yank the viewport back to the top on every
     /// background re-list.
     pub last_loaded_seq: Option<u32>,
+    /// Cached mtime (seconds) of the session's snaps dir, used to short-
+    /// circuit `refresh()` when no new snaps have landed.
+    pub last_snaps_mtime: Option<i64>,
 }
 
 impl CodeReviewState {
@@ -95,7 +102,9 @@ impl CodeReviewState {
             prev_snap: None,
             file_first_idx,
             file_view: FileViewState::default(),
+            cached_lines: None,
             last_loaded_seq: None,
+            last_snaps_mtime: None,
         };
         s.refresh_current();
         s
@@ -104,10 +113,26 @@ impl CodeReviewState {
     /// Re-list snaps from disk. Preserves the current snap by id, the file
     /// cursor, and the viewport (the file_view cache rebuild is driven by
     /// `refresh_current` only when the snap actually changes).
+    ///
+    /// Cheap fast path: stat the session's snaps dir and short-circuit if
+    /// its mtime hasn't changed since the last refresh. This is O(1) on a
+    /// no-op (one syscall) vs. O(N) for a full re-list with parse.
     pub fn refresh(&mut self) {
+        let snaps_dir = self.store.paths().session_snaps(&self.session.id);
+        let mtime = std::fs::metadata(&snaps_dir)
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs() as i64);
+        if let (Some(prev), Some(now)) = (self.last_snaps_mtime, mtime) {
+            if prev == now {
+                return;
+            }
+        }
+        self.last_snaps_mtime = mtime;
+
         let current_file = self.current_file().map(|s| s.to_string());
         let current_seq = self.last_loaded_seq;
-        let old_len = self.entries.len();
         self.entries = self.store.snaps().list(&self.session.id).unwrap_or_default();
         sort_entries_by_time(&mut self.entries);
         self.files.clear();
@@ -136,9 +161,6 @@ impl CodeReviewState {
                 self.cur_file_idx = pos;
             }
         }
-        // If the list grew and we were at the end, leave the cursor where
-        // it was (don't auto-advance) — the user can press `]` to step.
-        let _ = old_len; // (we keep this around for future logic; not used now)
         self.refresh_current();
     }
 
@@ -155,6 +177,7 @@ impl CodeReviewState {
         if new_snap.is_none() {
             self.current_snap = None;
             self.file_view.lines.clear();
+            self.cached_lines = None;
             self.prev_snap = None;
             self.last_loaded_seq = None;
             return;
@@ -166,14 +189,55 @@ impl CodeReviewState {
                 .find(|e| e.seq == seq)
                 .and_then(|e| SnapStore::read_path(&e.path).ok())
         });
-        // Only reset scroll when the snap actually changes. The TUI calls
-        // `refresh()` periodically to pick up new captures; without this
-        // guard, every refresh would yank the viewport back to the top.
+        // Only rebuild the rendered line vec when the snap actually
+        // changes. The TUI calls `refresh()` periodically to pick up new
+        // captures; without this guard, every refresh would yank the
+        // viewport back to the top AND re-run highlight on every line of
+        // the file — which is the dominant per-frame cost.
         if new_seq != self.last_loaded_seq {
             self.file_view.scroll = 0;
+            // new_snap is Some(_) here (we returned early on None above).
+            let snap_ref = new_snap.as_ref().expect("new_snap is Some after the early return");
+            let prev = self.prev_snap.clone();
+            self.rebuild_cached_lines(snap_ref, &prev);
         }
         self.current_snap = new_snap;
         self.last_loaded_seq = new_seq;
+    }
+
+    fn rebuild_cached_lines(
+        &mut self,
+        snap: &Snap,
+        prev_snap: &Option<Snap>,
+    ) {
+        let prev_content = prev_snap
+            .as_ref()
+            .filter(|p| p.file_path == snap.file_path)
+            .map(|p| p.content.as_str())
+            .unwrap_or("");
+        // A fresh HighlightEngine is needed to call `syntax_for` (mutable
+        // due to the cache). We don't keep the engine on CodeReviewState
+        // because the shell owns it for the entire view lifetime; the
+        // rebuild path is on snap change (rare), so constructing one here
+        // is fine.
+        //
+        // ...actually, the render path is given the engine, and we want to
+        // avoid constructing one here. Instead, expose the build as a free
+        // function and have `render` call it when the cache is empty.
+        // For now, keep the engine out of state by inlining the build
+        // here with a local engine — this is a one-shot per snap change.
+        let mut engine = crate::tui::highlight::HighlightEngine::new(
+            &self.store.config().tui.syntax_theme,
+        );
+        let lines = crate::tui::highlight::render_snap(
+            &mut engine,
+            prev_content,
+            &snap.content,
+            &snap.file_path,
+            true,
+        );
+        self.cached_lines = Some(lines.clone());
+        self.file_view.lines = lines;
     }
 
     pub fn on_action(
@@ -295,7 +359,7 @@ fn jump_to_change(lines: &[ratatui::text::Line<'_>], cur: u16, forward: bool) ->
 pub fn render(
     f: &mut Frame,
     state: &mut CodeReviewState,
-    engine: &mut HighlightEngine,
+    _engine: &mut HighlightEngine,
 ) {
     let area = f.size();
     let chunks = Layout::default()
@@ -346,17 +410,16 @@ pub fn render(
     // File content
     let file_area = chunks[2];
     if let Some(snap) = state.current_snap.clone() {
-        // Source the prior text from `prev_snap` (same file, previous
-        // sequence) so removed lines can render with their actual content.
-        // First snap of a file has no prev; treat as empty prev.
-        let prev_content = state
-            .prev_snap
-            .as_ref()
-            .filter(|p| p.file_path == snap.file_path)
-            .map(|p| p.content.as_str())
-            .unwrap_or("");
-        let lines = render_snap(engine, prev_content, &snap.content, &snap.file_path, true);
-        state.file_view.lines = lines;
+        // Reuse the cached lines from refresh_current. If for any reason
+        // the cache is empty (e.g. on the very first frame after load
+        // before refresh_current has been called by the shell), fall back
+        // to a one-shot render. (In practice refresh_current is called
+        // from `load`, so the cache is always populated by the time we
+        // get here.)
+        if state.cached_lines.is_none() {
+            let prev = state.prev_snap.clone();
+            state.rebuild_cached_lines(&snap, &prev);
+        }
         file_view::render(
             f,
             &mut state.file_view,

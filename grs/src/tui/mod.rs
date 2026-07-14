@@ -29,7 +29,7 @@ use grs_lib::store::RepoStore;
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use std::io;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// What a view returns in response to a key. The shell applies the effect
 /// at the top of the view stack.
@@ -86,20 +86,10 @@ fn shell_event_loop(
 ) -> Result<(), CommandError> {
     let mut parser = VimParser::new();
     let tick = Duration::from_millis(16);
-    let mut last_refresh = Instant::now();
     loop {
         terminal
             .draw(|f| draw_top(f, stack))
             .map_err(CommandError::internal_error)?;
-
-        // Periodic refresh of the top view so live capture shows up
-        // without the user pressing `r`.
-        if last_refresh.elapsed() >= Duration::from_secs(1) {
-            last_refresh = Instant::now();
-            if let Some(slot) = stack.last_mut() {
-                refresh_top(slot);
-            }
-        }
 
         if event::poll(tick).map_err(CommandError::internal_error)? {
             if let Ok(Event::Key(key)) = event::read() {
@@ -147,10 +137,10 @@ fn draw_top(f: &mut ratatui::Frame, stack: &mut [ViewSlot]) {
 }
 
 fn refresh_top(slot: &mut ViewSlot) {
-    match slot {
-        ViewSlot::SessionList(s) => s.refresh(),
-        ViewSlot::CodeReview(cr, _) => cr.refresh(),
-    }
+    // Unused after step 8 dropped the once-per-second auto-refresh. Kept
+    // around in case future views want a refresh hook; the public `r`
+    // key still calls `ViewSlot::refresh()` directly through the views.
+    let _ = slot;
 }
 
 fn dispatch(
