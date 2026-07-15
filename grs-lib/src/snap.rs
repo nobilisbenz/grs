@@ -164,14 +164,45 @@ impl SnapStore {
         // most recent snap that mentioned each path. Walk newest to
         // oldest; stop early when every current-tree path has been
         // accounted for.
+        //
+        // A file whose most recent snap is a `removed: true` entry is
+        // **fully gone** from the project — the on-disk file no longer
+        // exists, and the next time it appears it will be a brand-new
+        // file (no prior content to diff against). We deliberately do
+        // NOT include such files in `prev_by_path`: otherwise every
+        // subsequent capture would see the file missing from the
+        // current tree, find it in `prev_by_path` with `content: ""`
+        // (the removal snap's content is empty by design), and emit a
+        // duplicate removal snap with `prev_content: ""`. Those
+        // duplicates showed up as "removed files still showing empty
+        // multiple times in snaps" — one removal snap per save, each
+        // with the prior content blanked out.
+        //
+        // Note: we must remember "removed" across the whole walk, not
+        // just per-snap. The walk is newest -> oldest; a removal snap
+        // (most recent) might be followed by an older "add" snap for
+        // the same path. Without remembering the removal, the older
+        // add would be picked up as the prev and the duplicate would
+        // re-emerge.
         let current_paths: std::collections::HashSet<String> =
             tree_pairs.iter().map(|(p, _)| p.clone()).collect();
         let mut prev_by_path: std::collections::HashMap<String, PrevEntry> =
             std::collections::HashMap::new();
+        let mut removed_paths: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
         for entry in self.list(id)?.into_iter().rev() {
             let snap = read_snap_json_at(&entry.path)?;
             for f in &snap.files {
-                if prev_by_path.contains_key(&f.path) {
+                if prev_by_path.contains_key(&f.path) || removed_paths.contains(&f.path) {
+                    continue;
+                }
+                if f.removed {
+                    // Most recent mention of this path is a removal —
+                    // the file is gone. Remember it and skip so
+                    // future captures don't re-emit the removal (and
+                    // so older non-removed snaps for the same path
+                    // don't sneak in as the "prev").
+                    removed_paths.insert(f.path.clone());
                     continue;
                 }
                 prev_by_path.insert(
@@ -719,6 +750,76 @@ mod tests {
         assert_eq!(removed.prev_content.as_deref(), Some("goodbye\n"));
         // keep.txt unchanged — must NOT be in s2.
         assert!(s2.iter().all(|s| s.file_path != "keep.txt"));
+    }
+
+    /// Regression: once a file has been captured as removed, subsequent
+    /// captures must NOT re-emit a removal snap for it. Previously,
+    /// the most recent snap for the deleted file (its own removal
+    /// snap, with `content: ""`) was being pulled into `prev_by_path`
+    /// on every capture, so any later save that triggered a capture
+    /// would produce another removal snap — with `prev_content: ""`
+    /// because the prior mention was itself a removal. The user saw
+    /// this as "removed files still showing empty multiple times in
+    /// snaps".
+    #[test]
+    fn deleted_file_does_not_reappear_in_subsequent_captures() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        std::fs::create_dir_all(root.join(".grs/sessions")).unwrap();
+        let id = SessionId::new();
+        std::fs::create_dir_all(root.join(".grs/sessions").join(id.as_str())).unwrap();
+        std::fs::write(root.join("doomed.txt"), "goodbye\n").unwrap();
+        std::fs::write(root.join("keep.txt"), "stable\n").unwrap();
+
+        let paths = GrsPaths::new(&root);
+        let store = SnapStore::new(paths);
+        let ignore = IgnoreMatcher::new(&root, &[]).unwrap();
+        store.capture(&id, &ignore).unwrap();
+
+        // Delete the doomed file and capture: one removal snap with
+        // the original content preserved in `prev_content`.
+        std::fs::remove_file(root.join("doomed.txt")).unwrap();
+        let s1 = store.capture(&id, &ignore).unwrap();
+        assert_eq!(s1.len(), 1);
+        assert_eq!(s1[0].file_path, "doomed.txt");
+        assert!(s1[0].files[0].removed);
+        assert_eq!(s1[0].files[0].prev_content.as_deref(), Some("goodbye\n"));
+
+        // A no-op capture (tree unchanged) must produce zero snaps.
+        // The deleted file must NOT reappear as an empty removal.
+        let s2 = store.capture(&id, &ignore).unwrap();
+        assert!(
+            s2.is_empty(),
+            "no-op capture must not re-emit the removal snap, got {} snap(s) for {:?}",
+            s2.len(),
+            s2.iter().map(|s| (&s.file_path, s.files[0].removed)).collect::<Vec<_>>()
+        );
+
+        // A subsequent save to a *different* file must not drag the
+        // deleted file back in either.
+        std::fs::write(root.join("keep.txt"), "stable2\n").unwrap();
+        let s3 = store.capture(&id, &ignore).unwrap();
+        assert_eq!(s3.len(), 1, "expected exactly one snap (for keep.txt), got {}", s3.len());
+        assert_eq!(s3[0].file_path, "keep.txt");
+        assert!(
+            s3.iter().all(|s| s.file_path != "doomed.txt"),
+            "deleted file must not reappear in subsequent snaps"
+        );
+
+        // A re-creation of the deleted path with new content should
+        // be captured as a brand-new file (no prev_content) — not as
+        // a modification against the old removal's empty content.
+        std::fs::write(root.join("doomed.txt"), "back from the dead\n").unwrap();
+        let s4 = store.capture(&id, &ignore).unwrap();
+        let doomed = s4
+            .iter()
+            .find(|s| s.file_path == "doomed.txt")
+            .expect("recreated file must produce a snap");
+        assert!(!doomed.files[0].removed);
+        assert!(doomed.files[0].prev_content.is_none(),
+            "recreated file is a brand-new file: prev_content must be None, got {:?}",
+            doomed.files[0].prev_content);
+        assert_eq!(doomed.files[0].content, "back from the dead\n");
     }
 
     /// Every snap carries a `tree_sha` that fingerprints the full
