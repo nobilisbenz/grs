@@ -400,7 +400,7 @@ Session list keys
 
 In the code review view: j/k scroll, J/K 10-line jump,
 gg/G top/bottom of the current snap, n/N next/prev change,
-[ / ] prev/next snap, tab next file, q / Esc back to the list.
+h/l prev/next snap, tab next file, q / Esc back to the list.
 ";
     let paragraph = Paragraph::new(body)
         .block(

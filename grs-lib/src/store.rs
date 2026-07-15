@@ -77,6 +77,8 @@ impl RepoStore {
         };
         let session = store.sessions().create_new(now_ms())?;
         store.set_head(&session.id)?;
+        // Capture initial state of all tracked files as snap 0, 1, 2, ...
+        let _ = capture_initial_state(&store, &session.id);
         // Re-load config (now that the file exists) so the returned store has it.
         let user = Config::load_user();
         let repo_cfg = Config::load_repo(root)?;
@@ -154,6 +156,8 @@ impl RepoStore {
         }
         let new_session = self.sessions().create_new(now)?;
         self.set_head(&new_session.id)?;
+        // Capture initial state of all tracked files as snap 0, 1, 2, ...
+        let _ = capture_initial_state(self, &new_session.id);
         Ok(new_session)
     }
 
@@ -256,6 +260,64 @@ pub fn recompute_counts(store: &RepoStore, id: &SessionId) -> Result<(u32, u32)>
         }
     }
     Ok((snap_count, files.len() as u32))
+}
+
+/// Capture the current state of all tracked files as initial snaps (seq 0, 1, 2, ...)
+/// when a new session is created. This ensures every session starts with a baseline
+/// of the directory state.
+pub fn capture_initial_state(store: &RepoStore, session_id: &SessionId) -> Result<()> {
+    let ignore = store.ignore_matcher()?;
+    let files = ignore.files();
+    let snap_store = store.snaps();
+    let mut seq = 0u32;
+    
+    // Skip config files that shouldn't be tracked as user content
+    let skip_files = [".grsignore", ".gitignore"];
+    
+    for path in files {
+        // Get the repo-relative path
+        let rel = crate::paths::relativize(store.root(), &path);
+        if rel.is_empty() {
+            continue;
+        }
+        
+        // Skip config files
+        if skip_files.contains(&rel.as_str()) {
+            continue;
+        }
+        
+        // Skip binary files
+        if crate::util::fs::is_binary_file(&path) {
+            continue;
+        }
+        
+        // Read the file content
+        let content = match crate::util::fs::read_content_or_binary_placeholder(&path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        
+        // Create the initial snap with empty diff (no previous state)
+        let diff = crate::diff::line_diff("", &content);
+        let mut diff = diff;
+        diff.prev_seq = None;
+        
+        let mut snap = SnapStore::build_snap(
+            seq,
+            rel,
+            content,
+            diff,
+            None,
+        );
+        snap.timestamp = now_ms();
+        snap.timestamp_iso = crate::util::time::iso(snap.timestamp);
+        snap_store.write(session_id, snap)?;
+        seq += 1;
+    }
+    
+    // Update session counts
+    update_session_counts(store, session_id)?;
+    Ok(())
 }
 
 /// `now_ms` re-export for commands that need a fresh timestamp.

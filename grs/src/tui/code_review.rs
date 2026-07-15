@@ -454,7 +454,7 @@ pub fn render(
         Span::raw(" 10-line  "),
         Span::styled("gg/G", Style::default().fg(ACCENT)),
         Span::raw(" jump  "),
-        Span::styled("[/]", Style::default().fg(ACCENT)),
+        Span::styled("h/l", Style::default().fg(ACCENT)),
         Span::raw(" snap  "),
         Span::styled("tab", Style::default().fg(ACCENT)),
         Span::raw(" file  "),
@@ -491,7 +491,8 @@ Code review keys
   J / K         10-line jump (shift + j / k)
   gg / G        top / bottom of the current snap
   n / N         next / prev change row (no-op at boundary)
-  [ / ]         prev / next snap in the session
+  h / l         prev / next snap in the session
+  [ / ]         prev / next snap (alternative)
   tab           next file's first snap
   r             refresh from disk
   ?             toggle this help

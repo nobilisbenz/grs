@@ -147,19 +147,11 @@ impl VimParser {
             }
             KeyCode::Char('h') | KeyCode::Left => {
                 self.reset();
-                KeyOutcome::Action(KeyAction::Back)
+                KeyOutcome::Action(KeyAction::PrevSnap)
             }
             KeyCode::Char('l') | KeyCode::Right => {
                 self.reset();
-                KeyOutcome::Action(KeyAction::Enter)
-            }
-            KeyCode::Char('J') => {
-                self.reset();
-                KeyOutcome::Action(KeyAction::JumpDown10)
-            }
-            KeyCode::Char('K') => {
-                self.reset();
-                KeyOutcome::Action(KeyAction::JumpUp10)
+                KeyOutcome::Action(KeyAction::NextSnap)
             }
             KeyCode::Char('[') => {
                 self.reset();
@@ -169,6 +161,15 @@ impl VimParser {
                 self.reset();
                 KeyOutcome::Action(KeyAction::NextSnap)
             }
+            KeyCode::Char('J') => {
+                self.reset();
+                KeyOutcome::Action(KeyAction::JumpDown10)
+            }
+            KeyCode::Char('K') => {
+                self.reset();
+                KeyOutcome::Action(KeyAction::JumpUp10)
+            }
+
             KeyCode::Char('g') => match self.state {
                 KeyState::Idle => {
                     self.state = KeyState::PendingG;
@@ -249,10 +250,9 @@ mod tests {
         let mut p = VimParser::new();
         assert!(matches!(p.feed(k('j')), KeyOutcome::Action(KeyAction::Down)));
         assert!(matches!(p.feed(k('k')), KeyOutcome::Action(KeyAction::Up)));
-        // `h`/`l` are no longer bound to step actions; they go through the
-        // generic arm and return `None` (effectively a no-op for the view).
-        assert!(matches!(p.feed(k('h')), KeyOutcome::Action(KeyAction::Back)));
-        assert!(matches!(p.feed(k('l')), KeyOutcome::Action(KeyAction::Enter)));
+        // `h`/`l` navigate between snaps (prev/next).
+        assert!(matches!(p.feed(k('h')), KeyOutcome::Action(KeyAction::PrevSnap)));
+        assert!(matches!(p.feed(k('l')), KeyOutcome::Action(KeyAction::NextSnap)));
     }
 
     #[test]
@@ -263,10 +263,12 @@ mod tests {
     }
 
     #[test]
-    fn brackets_step_snap() {
+    fn brackets_and_hl_step_snap() {
         let mut p = VimParser::new();
         assert!(matches!(p.feed(k('[')), KeyOutcome::Action(KeyAction::PrevSnap)));
         assert!(matches!(p.feed(k(']')), KeyOutcome::Action(KeyAction::NextSnap)));
+        assert!(matches!(p.feed(k('h')), KeyOutcome::Action(KeyAction::PrevSnap)));
+        assert!(matches!(p.feed(k('l')), KeyOutcome::Action(KeyAction::NextSnap)));
     }
 
     #[test]
