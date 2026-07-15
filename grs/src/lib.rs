@@ -28,4 +28,12 @@ pub struct GlobalArgs {
     /// Enable debug logging.
     #[arg(long, global = true)]
     pub verbose: bool,
+
+    /// Open the TUI in read-only mode: no project lock, no internal
+    /// watcher. Use when another `grs watch` is already capturing
+    /// the project (e.g. the pi `grs-capture` extension's background
+    /// watcher) and you want to browse the journal from a second
+    /// terminal without contending for the lock.
+    #[arg(long, global = true)]
+    pub read_only: bool,
 }

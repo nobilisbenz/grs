@@ -1,0 +1,22 @@
+# grs defaults
+.git/
+node_modules/
+target/
+dist/
+build/
+.grs/
+.grsignore
+# editor transient files — would otherwise create a snap per save
+*~
+.*~
+*.swp
+*.swo
+*.swn
+*.bak
+*.tmp
+*.orig
+*.rej
+.#*
+.DS_Store
+*.lock
+*.lockb

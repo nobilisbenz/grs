@@ -39,11 +39,17 @@ const TICK: Duration = Duration::from_millis(100);
 
 /// Open the live TUI. If the project has no open session, runs a name
 /// prompt first; on confirm, creates the session and proceeds.
-pub fn run_tui(store: RepoStore) -> Result<(), CommandError> {
+///
+/// `with_watcher=false` opens the TUI in read-only mode: no project
+/// lock, no internal watcher. Use this when another `grs watch`
+/// process is already capturing the project (e.g. the pi extension's
+/// background watcher) and you want to browse the journal without
+/// contending for the lock.
+pub fn run_tui(store: RepoStore, with_watcher: bool) -> Result<(), CommandError> {
     crate::warnings::check_and_warn(store.root());
 
     let mut terminal = setup_terminal().map_err(CommandError::internal_error)?;
-    let result = run_tui_inner(&mut terminal, store);
+    let result = run_tui_inner(&mut terminal, store, with_watcher);
     teardown_terminal(&mut terminal).map_err(CommandError::internal_error)?;
     result
 }
@@ -51,6 +57,7 @@ pub fn run_tui(store: RepoStore) -> Result<(), CommandError> {
 fn run_tui_inner(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     store: RepoStore,
+    with_watcher: bool,
 ) -> Result<(), CommandError> {
     // Ensure a session exists. If not, prompt for a name and create one.
     if store.current_session().map_err(CommandError::from)?.is_none() {
@@ -63,9 +70,18 @@ fn run_tui_inner(
         }
     }
 
-    // Acquire the project lock and start the watcher.
-    let _guard = store.lock().map_err(CommandError::from)?;
-    let _watcher = watch::WatcherGuard::start(store.clone());
+    // Acquire the project lock and start the watcher, unless the
+    // caller asked for read-only mode (in which case another `grs
+    // watch` is presumably already capturing).
+    let _guard;
+    let _watcher;
+    if with_watcher {
+        _guard = Some(store.lock().map_err(CommandError::from)?);
+        _watcher = Some(watch::WatcherGuard::start(store.clone()));
+    } else {
+        _guard = None;
+        _watcher = None;
+    }
 
     // Run the session list, then optionally the code review.
     let mut list = SessionListState::load(store.clone());

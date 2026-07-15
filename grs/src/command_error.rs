@@ -129,9 +129,9 @@ impl From<GrsError> for CommandError {
             ))
             .hinted("Names must be non-empty."),
             GrsError::AlreadyRunning(detail) => CommandError::user_error(format!(
-                "another TUI is already running on this project ({detail})"
+                "another grs process is already running on this project ({detail})"
             ))
-            .hinted("Quit the other TUI first, or wait for it to exit."),
+            .hinted("Quit the other process (TUI or `grs watch`) first, or wait for it to exit."),
             GrsError::Io(e) => CommandError::user_error_with_message("io error", e),
             GrsError::Json(e) => CommandError::user_error_with_message("json error", e),
             GrsError::Toml(e) => CommandError::user_error_with_message("toml error", e),

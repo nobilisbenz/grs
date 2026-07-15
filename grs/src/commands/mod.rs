@@ -7,6 +7,7 @@
 //! - `grs session rename`      rename a session
 //! - `grs session rm`          delete a closed session's folder
 //! - `grs new <name>`          finalize current open session, start a new one
+//! - `grs watch`               run the file watcher headless (no TUI)
 //! - `grs completions <shell>` generate shell completions
 //! - `grs man`                 generate man page
 //! - `grs config`              view/edit layered config
@@ -19,6 +20,7 @@ pub mod completions;
 pub mod config;
 pub mod new;
 pub mod session;
+pub mod watch;
 
 #[derive(clap::Parser, Clone, Debug)]
 #[command(
@@ -38,6 +40,9 @@ pub struct Args {
 pub enum Command {
     /// Finalize the current open session and start a new one.
     New(new::NewArgs),
+    /// Run the file watcher headless (no TUI). For non-interactive
+    /// callers that want a long-lived capture process on a project.
+    Watch(watch::WatchArgs),
     /// Manage sessions (list, view, rename, remove).
     #[command(subcommand)]
     Session(session::SessionCmd),
@@ -59,11 +64,12 @@ pub async fn run_command(
         None => {
             // No subcommand: open the TUI shell.
             let store = command.store_or_init().map_err(CommandError::from)?;
-            return crate::tui::run_tui(store);
+            return crate::tui::run_tui(store, !command.global().read_only);
         }
     };
     match cmd {
         Command::New(a) => new::cmd_new(ui, command, a).await,
+        Command::Watch(a) => watch::cmd_watch(ui, command, a).await,
         Command::Session(s) => session::run(ui, command, s).await,
         Command::Completions(a) => completions::cmd_completions(a),
         Command::Config(a) => config::cmd_config(ui, command, a).await,

@@ -125,7 +125,7 @@ async fn view(_ui: &mut Ui, command: &CommandHelper, args: &ViewArgs) -> Result<
     let _ = command;
     let _ = args;
     let store = command.store().map_err(CommandError::from)?;
-    crate::tui::run_tui(store)
+    crate::tui::run_tui(store, !command.global().read_only)
 }
 
 async fn rename(
