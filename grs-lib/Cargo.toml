@@ -16,7 +16,6 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 ulid = { workspace = true }
 notify = { workspace = true }
-notify-debouncer-full = { workspace = true }
 similar = { workspace = true }
 ignore = { workspace = true }
 tempfile = { workspace = true }

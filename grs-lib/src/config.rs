@@ -1,6 +1,9 @@
 //! Layered config: built-in defaults < user config < repo config < CLI flags.
-//! Phase 1 keeps it minimal: `watcher.debounce_ms`, plus a few `replay`/`log`
-//! knobs.
+//!
+//! The watcher no longer has a `debounce_ms` knob: snap triggers are
+//! purely event-driven (Close(Write) or Create on a tracked path).
+//! Phase 1 keeps the remaining config minimal: a few ignore patterns
+//! and a syntax theme.
 
 use crate::error::{GrsError, Result};
 use crate::util::time::Millis;
@@ -15,10 +18,8 @@ pub struct Config {
     pub tui: TuiConfig,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct WatcherConfig {
-    #[serde(default = "default_debounce_ms")]
-    pub debounce_ms: u64,
     /// Extra ignore patterns appended to `.grsignore`.
     #[serde(default)]
     pub ignore_extra: Vec<String>,
@@ -30,20 +31,8 @@ pub struct TuiConfig {
     pub syntax_theme: String,
 }
 
-fn default_debounce_ms() -> u64 {
-    1500
-}
 fn default_syntax_theme() -> String {
     "base16-eighties.dark".to_string()
-}
-
-impl Default for WatcherConfig {
-    fn default() -> Self {
-        Self {
-            debounce_ms: 1500,
-            ignore_extra: Vec::new(),
-        }
-    }
 }
 
 impl Default for TuiConfig {
@@ -87,11 +76,6 @@ impl Config {
     pub fn merged_with(self, other: Config) -> Config {
         Config {
             watcher: WatcherConfig {
-                debounce_ms: if other.watcher.debounce_ms != WatcherConfig::default().debounce_ms {
-                    other.watcher.debounce_ms
-                } else {
-                    self.watcher.debounce_ms
-                },
                 ignore_extra: if other.watcher.ignore_extra.is_empty() {
                     self.watcher.ignore_extra
                 } else {
@@ -154,16 +138,11 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
-    fn defaults() {
-        let c = Config::default();
-        assert_eq!(c.watcher.debounce_ms, 1500);
-    }
-
-    #[test]
     fn load_missing_is_defaults() {
         let dir = tempdir().unwrap();
         let c = Config::load_repo(dir.path()).unwrap();
-        assert_eq!(c.watcher.debounce_ms, 1500);
+        // ignore_extra defaults to empty.
+        assert!(c.watcher.ignore_extra.is_empty());
     }
 
     #[test]
@@ -171,8 +150,8 @@ mod tests {
         let dir = tempdir().unwrap();
         let cfg_path = dir.path().join(".grs").join("config.toml");
         std::fs::create_dir_all(cfg_path.parent().unwrap()).unwrap();
-        std::fs::write(&cfg_path, "[watcher]\ndebounce_ms = 250\n").unwrap();
+        std::fs::write(&cfg_path, "[watcher]\nignore_extra = [\"*.tmp\"]\n").unwrap();
         let c = Config::load_repo(dir.path()).unwrap();
-        assert_eq!(c.watcher.debounce_ms, 250);
+        assert_eq!(c.watcher.ignore_extra, vec!["*.tmp".to_string()]);
     }
 }

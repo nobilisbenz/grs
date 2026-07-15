@@ -4,9 +4,27 @@
 //! closes because the TUI owns the watcher thread and signals it to stop
 //! on drop.
 //!
-//! In the per-project snapshot model, the watcher is simple: any debounced
-//! batch of filesystem events triggers a single full-project snap. There
-//! is no per-file chain — every save is a checkpoint of the whole tree.
+//! Trigger model: a snap is captured when a raw notify event matches
+//! either of these:
+//!
+//! - `EventKind::Access(AccessKind::Close(AccessMode::Write))` on a
+//!   tracked path — covers most "dumb" editor saves (VSCode default,
+//!   gedit, Sublime non-atomic) and the post-rename completion of
+//!   atomic-save flows on Linux (vim/IntelliJ/VSCode-safe-write), since
+//!   the kernel closes the renamed file's handle as part of `rename(2)`.
+//! - `EventKind::Create(CreateKind::File)` on a tracked path — covers
+//!   `cat > foo`, `sed -i`, and the post-rename event on macOS where
+//!   FSEvents surfaces the rename as a Created event.
+//!
+//! Both events pass through a dedupe check in `SnapStore::capture_if_changed`:
+//! before writing a new `snap-N/`, the current tree is SHA256-scanned
+//! and compared to the most recent snap. If identical, no new snap is
+//! allocated. This means a save that fires several notify events
+//! back-to-back produces one snap (the first event where the tree has
+//! actually changed), with the rest becoming no-ops.
+//!
+//! There is **no time-based debounce** and **no quiet-period fallback**.
+//! The trigger is purely event-driven.
 
 use crate::config::Config;
 use crate::error::Result;
@@ -15,8 +33,10 @@ use crate::paths::GrsPaths;
 use crate::snap::SnapStore;
 use crate::store::RepoStore;
 use crate::ulid::SessionId;
-use notify::{RecursiveMode, Watcher as NotifyWatcher};
-use notify_debouncer_full::{new_debouncer, DebounceEventResult, Debouncer, FileIdMap};
+use notify::{
+    event::{AccessKind, AccessMode, CreateKind, EventKind},
+    RecommendedWatcher, RecursiveMode, Watcher as NotifyWatcher,
+};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::Duration;
@@ -59,7 +79,7 @@ impl Watcher {
         let Watcher {
             root,
             store,
-            config,
+            config: _,
             paths: _,
         } = self;
 
@@ -69,20 +89,19 @@ impl Watcher {
             .current_session_id()?
             .ok_or_else(|| crate::error::GrsError::NotFound("no open session".to_string()))?;
 
-        // Set up the notify watcher (debounced).
-        let (tx, rx) = mpsc::channel::<DebounceEventResult>();
-        let debounce = Duration::from_millis(config.watcher.debounce_ms);
-        let mut debouncer: Debouncer<notify::RecommendedWatcher, FileIdMap> =
-            new_debouncer(debounce, None, tx).map_err(|e| {
-                crate::error::GrsError::Ignore(format!("watcher init failed: {e}"))
-            })?;
-        debouncer
-            .watcher()
+        // Set up a raw notify watcher. We do NOT use notify-debouncer-full:
+        // there is no time-based debounce in this design.
+        let (tx, rx) = mpsc::channel::<notify::Result<notify::Event>>();
+        let mut notify: RecommendedWatcher =
+            notify::recommended_watcher(move |res| {
+                let _ = tx.send(res);
+            })
+            .map_err(|e| crate::error::GrsError::Ignore(format!("watcher init failed: {e}")))?;
+        notify
             .watch(&root, RecursiveMode::Recursive)
             .map_err(|e| crate::error::GrsError::Ignore(format!("watch failed: {e}")))?;
-        let _ = debouncer.cache();
 
-        info!(watch_root = %root.display(), debounce_ms = config.watcher.debounce_ms, "grs watcher starting");
+        info!(watch_root = %root.display(), "grs watcher starting");
 
         let ignore_matcher = store.ignore_matcher()?;
         let snap_store = store.snaps();
@@ -98,20 +117,21 @@ impl Watcher {
             }
 
             match rx.recv_timeout(Duration::from_millis(500)) {
-                Ok(Ok(events)) => {
-                    if events.is_empty() {
-                        continue;
-                    }
-                    // Any debounced batch = one full-project snap.
-                    debug!(event_count = events.len(), "capturing snap from debounced batch");
-                    if let Err(e) = capture_one(&store, &open_session, &snap_store, &ignore_matcher) {
-                        warn!(?e, "snap capture failed");
+                Ok(Ok(event)) => {
+                    if is_save_trigger(&event, &ignore_matcher) {
+                        debug!(event_kind = ?event.kind, "save trigger — capturing snap");
+                        if let Err(e) = capture_if_changed(
+                            &store,
+                            &open_session,
+                            &snap_store,
+                            &ignore_matcher,
+                        ) {
+                            warn!(?e, "snap capture failed");
+                        }
                     }
                 }
-                Ok(Err(errs)) => {
-                    for e in errs {
-                        warn!(?e, "watcher error");
-                    }
+                Ok(Err(e)) => {
+                    warn!(?e, "watcher error");
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -121,22 +141,62 @@ impl Watcher {
             }
         }
 
+        // Drop the watcher to stop the OS-level subscription before returning.
+        drop(notify);
         info!(?stop_reason, "grs watcher exiting");
         Ok(())
     }
 }
 
-fn capture_one(
+/// True if this event should trigger a snap.
+///
+/// A trigger is a `Close(Write)` or `Create(File)` on a path that the
+/// ignore-matcher considers tracked (i.e. `!is_ignored(path)`). Other
+/// event kinds — `Modify(Data)`, `Modify(Metadata)`, `Modify(Name)`,
+/// `Remove`, etc. — are ignored: the trigger fires on the trailing
+/// event of a save, not the intermediate ones.
+fn is_save_trigger(event: &notify::Event, ignore: &IgnoreMatcher) -> bool {
+    let is_close_write = matches!(
+        event.kind,
+        EventKind::Access(AccessKind::Close(AccessMode::Write))
+    );
+    let is_create_file = matches!(
+        event.kind,
+        EventKind::Create(CreateKind::File)
+    );
+    if !is_close_write && !is_create_file {
+        return false;
+    }
+    event
+        .paths
+        .iter()
+        .any(|p| is_tracked_path(p, ignore))
+}
+
+/// True if `path` (absolute) is a tracked project file per the
+/// ignore-matcher. Tracked means: not ignored, and not inside a
+/// directory that is ignored.
+fn is_tracked_path(path: &Path, ignore: &IgnoreMatcher) -> bool {
+    if !path.starts_with(ignore.root()) {
+        return false; // event outside the watch root — ignore
+    }
+    !ignore.is_ignored(path)
+}
+
+fn capture_if_changed(
     store: &RepoStore,
     open_session: &SessionId,
     snap_store: &SnapStore,
     ignore: &IgnoreMatcher,
 ) -> Result<()> {
-    let meta = snap_store.capture(open_session, ignore)?;
-    store
-        .sessions()
-        .update_snap_count(open_session, meta.n)?;
-    debug!(n = meta.n, files = meta.file_count, "snap captured");
+    if let Some(meta) = snap_store.capture_if_changed(open_session, ignore)? {
+        store
+            .sessions()
+            .update_snap_count(open_session, meta.n)?;
+        debug!(n = meta.n, files = meta.file_count, "snap captured");
+    } else {
+        debug!("tree unchanged — no new snap");
+    }
     Ok(())
 }
 
@@ -146,8 +206,8 @@ pub fn run_for(root: &Path, stop: &mpsc::Receiver<()>) -> Result<()> {
     Watcher::new(store).run(stop)
 }
 
-// Re-export for tests / external callers.
-pub use notify_debouncer_full::DebouncedEvent as Event;
+// Re-export the raw event type for tests / external callers.
+pub use notify::Event;
 
 #[cfg(test)]
 mod tests {
@@ -157,20 +217,22 @@ mod tests {
     use std::sync::mpsc;
     use tempfile::tempdir;
 
-    /// Drive a single debounced flush through the watcher's batch handler
-    /// and assert a snap was created.
+    /// Drive a single Create trigger and assert a snap was created.
     #[test]
-    fn debounced_batch_creates_snap() {
+    fn create_event_creates_snap() {
         let dir = tempdir().unwrap();
         let store = RepoStore::init(dir.path()).unwrap();
         // init() does not create a session; we create one explicitly.
         let s = store.open_first_session("test".into()).unwrap();
         let head = s.id.clone();
-        // init() already captured snap 1; add a new file and capture snap 2.
+        // init() already captured snap 1; add a new file and trigger a
+        // second snap via the public capture_if_changed path.
         let ignore = store.ignore_matcher().unwrap();
         let snap_store = store.snaps();
         std::fs::write(dir.path().join("a.txt"), "hello\n").unwrap();
-        let meta = snap_store.capture(&head, &ignore).unwrap();
+        let meta = snap_store.capture_if_changed(&head, &ignore).unwrap();
+        assert!(meta.is_some(), "expected a snap, got None (tree unchanged?)");
+        let meta = meta.unwrap();
         assert!(meta.n >= 2, "expected snap >= 2, got {}", meta.n);
         assert!(store.paths().snap_dir(&head, meta.n).join("a.txt").is_file());
     }
@@ -186,7 +248,13 @@ mod tests {
         assert!(res.is_err(), "watcher must fail without an open session");
     }
 
-    // End-to-end: start the watcher, modify a file, verify a snap is captured.
+    // End-to-end: start the watcher, write a file, verify a snap is captured.
+    //
+    // With no debounce, a `std::fs::write` to a *new* path fires
+    // `Create(File)` followed by `Modify(Data)` followed by
+    // `Close(Write)`. The watcher reacts to Create, captures a snap, then
+    // reacts to Close(Write), and capture_if_changed dedupes it. Net
+    // result: exactly one new snap.
     #[test]
     fn end_to_end_captures_snap_on_save() {
         let dir = tempdir().unwrap();
@@ -200,11 +268,13 @@ mod tests {
         let handle = std::thread::spawn(move || {
             let _ = Watcher::new(watcher_store).run(&stop_rx);
         });
-        // Settle.
+        // Settle: let notify attach to the watch root.
         std::thread::sleep(Duration::from_millis(200));
-        // Write a new file. The 1.5s debounce will fire; give it a margin.
+        // Write a new file. The Create event triggers a snap; the
+        // trailing Close(Write) is deduped.
         std::fs::write(dir.path().join("new.txt"), "hello\n").unwrap();
-        std::thread::sleep(Duration::from_millis(2500));
+        // Wait for events to drain through the watcher's 500ms poll.
+        std::thread::sleep(Duration::from_millis(1000));
         let after = store.snaps().count(&session_id).unwrap();
         assert!(
             after > initial,
@@ -214,6 +284,108 @@ mod tests {
         let snap = store.snaps().read_meta(&session_id, after).unwrap();
         let has_new = snap.files.iter().any(|f| f.path == "new.txt");
         assert!(has_new, "new.txt should be in the latest snap");
+        stop_tx.send(()).ok();
+        let _ = handle.join();
+    }
+
+    /// End-to-end: explicit Close(Write) trigger. We open a file for
+    /// writing, write some bytes, then drop the handle to fire
+    /// `Close(Write)`. The watcher should capture a snap.
+    #[test]
+    fn end_to_end_captures_snap_on_close_write() {
+        let dir = tempdir().unwrap();
+        let store = RepoStore::init(dir.path()).unwrap();
+        let s = store.open_first_session("close-write".into()).unwrap();
+        let session_id = s.id.clone();
+        let initial = store.snaps().count(&session_id).unwrap();
+
+        let (stop_tx, stop_rx) = mpsc::channel();
+        let watcher_store = store.clone();
+        let handle = std::thread::spawn(move || {
+            let _ = Watcher::new(watcher_store).run(&stop_rx);
+        });
+        std::thread::sleep(Duration::from_millis(200));
+        // Open for write (creates the file or truncates if it exists),
+        // write, then drop. `drop` closes the handle and the kernel
+        // fires IN_CLOSE_WRITE.
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(dir.path().join("wrote.txt"))
+                .unwrap();
+            f.write_all(b"close-write content\n").unwrap();
+        }
+        std::thread::sleep(Duration::from_millis(1000));
+        let after = store.snaps().count(&session_id).unwrap();
+        assert!(
+            after > initial,
+            "watcher should have captured at least one new snap (initial={initial}, after={after})"
+        );
+        let snap = store.snaps().read_meta(&session_id, after).unwrap();
+        let has = snap.files.iter().any(|f| f.path == "wrote.txt");
+        assert!(has, "wrote.txt should be in the latest snap");
+        stop_tx.send(()).ok();
+        let _ = handle.join();
+    }
+
+    /// A save that produces several notify events (Create + Modify +
+    /// Close(Write) on a fresh file) should result in exactly one new
+    /// snap — capture_if_changed dedupes the trailing events.
+    #[test]
+    fn save_burst_dedupes_to_one_snap() {
+        let dir = tempdir().unwrap();
+        let store = RepoStore::init(dir.path()).unwrap();
+        let s = store.open_first_session("dedupe".into()).unwrap();
+        let session_id = s.id.clone();
+        let initial = store.snaps().count(&session_id).unwrap();
+
+        let (stop_tx, stop_rx) = mpsc::channel();
+        let watcher_store = store.clone();
+        let handle = std::thread::spawn(move || {
+            let _ = Watcher::new(watcher_store).run(&stop_rx);
+        });
+        std::thread::sleep(Duration::from_millis(200));
+        std::fs::write(dir.path().join("burst.txt"), "burst\n").unwrap();
+        // Wait long enough for Create + Close(Write) to land and the
+        // dedupe check to skip the duplicate.
+        std::thread::sleep(Duration::from_millis(1500));
+        let after = store.snaps().count(&session_id).unwrap();
+        assert_eq!(
+            after,
+            initial + 1,
+            "save burst should produce exactly one new snap (initial={initial}, after={after})"
+        );
+        stop_tx.send(()).ok();
+        let _ = handle.join();
+    }
+
+    /// Edits in a non-tracked directory (e.g. `.git/`) should NOT trigger
+    /// a snap, even though the watcher is watching the whole root.
+    #[test]
+    fn edits_in_ignored_dirs_do_not_snap() {
+        let dir = tempdir().unwrap();
+        let store = RepoStore::init(dir.path()).unwrap();
+        let s = store.open_first_session("ignored-dir".into()).unwrap();
+        let session_id = s.id.clone();
+        let initial = store.snaps().count(&session_id).unwrap();
+
+        let (stop_tx, stop_rx) = mpsc::channel();
+        let watcher_store = store.clone();
+        let handle = std::thread::spawn(move || {
+            let _ = Watcher::new(watcher_store).run(&stop_rx);
+        });
+        std::thread::sleep(Duration::from_millis(200));
+        // .git/ is in the default ignore list.
+        std::fs::create_dir_all(dir.path().join(".git/objects")).unwrap();
+        std::fs::write(dir.path().join(".git/objects/abc"), "data").unwrap();
+        std::thread::sleep(Duration::from_millis(1000));
+        let after = store.snaps().count(&session_id).unwrap();
+        assert_eq!(
+            after, initial,
+            "edits in .git/ should not create a snap (initial={initial}, after={after})"
+        );
         stop_tx.send(()).ok();
         let _ = handle.join();
     }

@@ -18,6 +18,7 @@ use crate::util::fs::atomic_write_str;
 use crate::util::time::now_ms;
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
+use tracing::debug;
 
 pub struct SnapStore {
     paths: GrsPaths,
@@ -82,6 +83,76 @@ impl SnapStore {
             .max()
             .map(|m| m + 1)
             .unwrap_or(1))
+    }
+
+    /// Capture a new snap only if the current tree differs from the most
+    /// recent one (by SHA256 of every tracked file). Returns `Some(meta)`
+    /// when a new snap was written, `None` when the tree is byte-identical
+    /// to the last snap and the write was skipped entirely — no new snap
+    /// number is allocated in that case.
+    ///
+    /// This is the entry point the watcher uses: with the "snap on
+    /// Close(Write) / Create" trigger set, a single save can fire several
+    /// filesystem events back-to-back. The dedupe here turns the trailing
+    /// duplicates into a no-op instead of stacking empty-file or
+    /// intermediate-state snaps.
+    pub fn capture_if_changed(
+        &self,
+        id: &SessionId,
+        ignore: &IgnoreMatcher,
+    ) -> Result<Option<SnapMeta>> {
+        if self.tree_matches_last_snap(id, ignore)? {
+            debug!("tree unchanged since last snap — skipping capture");
+            return Ok(None);
+        }
+        Ok(Some(self.capture(id, ignore)?))
+    }
+
+    /// True if the current project tree (filtered by `ignore`) is
+    /// byte-identical to the most recent snap: same set of relative paths,
+    /// same SHA256 for each. Returns `true` vacuously if there is no
+    /// previous snap (i.e. snap-1 hasn't been captured yet).
+    fn tree_matches_last_snap(
+        &self,
+        id: &SessionId,
+        ignore: &IgnoreMatcher,
+    ) -> Result<bool> {
+        let last_n = match self.list(id)?.into_iter().last() {
+            Some(e) => e.n,
+            None => return Ok(true), // no prior snap — caller will write snap-1
+        };
+        let prev_meta = self.read_meta(id, last_n)?;
+        // Build a path -> sha256 map of the current tree.
+        let mut current: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        let root = ignore.root().to_path_buf();
+        for abs in ignore.files() {
+            let rel = relativize(&root, &abs);
+            if rel.is_empty() {
+                continue;
+            }
+            match hash_file(&abs) {
+                Some(sha) => {
+                    current.insert(rel, sha);
+                }
+                None => {
+                    // File unreadable or vanished between walk and read.
+                    // That alone is a state change — call it not-equal so we
+                    // don't skip the capture.
+                    return Ok(false);
+                }
+            }
+        }
+        if current.len() != prev_meta.files.len() {
+            return Ok(false);
+        }
+        for prev_file in &prev_meta.files {
+            match current.get(&prev_file.path) {
+                Some(sha) if sha == &prev_file.sha256 => continue,
+                _ => return Ok(false),
+            }
+        }
+        Ok(true)
     }
 
     /// Capture the current state of the project (filtered by `ignore`) as a
@@ -179,6 +250,14 @@ fn capture_one(src: &Path, dest_root: &Path, rel: &str) -> Result<Option<SnapFil
         size: bytes.len() as u64,
         binary: is_binary,
     }))
+}
+
+/// Compute SHA256 of a file. Returns `None` if the file can't be read.
+fn hash_file(path: &Path) -> Option<String> {
+    let bytes = std::fs::read(path).ok()?;
+    let mut h = Sha256::new();
+    h.update(&bytes);
+    Some(format!("{:x}", h.finalize()))
 }
 
 fn read_meta(snap_dir: &Path) -> Result<SnapMeta> {

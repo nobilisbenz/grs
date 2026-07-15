@@ -6,9 +6,9 @@
 //! ```text
 //! grs config show                        # show effective (merged) config
 //! grs config show --layer user           # just the user config file
-//! grs config get watcher.debounce_ms     # effective value
-//! grs config set watcher.debounce_ms 250 # set in user config
-//! grs config unset watcher.debounce_ms   # remove from user config
+//! grs config get watcher.ignore_extra    # effective value
+//! grs config set watcher.ignore_extra '["*.tmp"]'  # set in user config
+//! grs config unset watcher.ignore_extra  # remove from user config
 //! grs config path                       # print path to each config file
 //! grs config edit                       # $EDITOR the user config
 //! ```
@@ -37,14 +37,14 @@ pub enum ConfigCommand {
         #[arg(long, value_enum)]
         layer: Option<ConfigLayerArg>,
     },
-    /// Print the value of one key (dotted path: e.g. `watcher.debounce_ms`).
+    /// Print the value of one key (dotted path: e.g. `watcher.ignore_extra`).
     Get {
-        /// Dotted key path, e.g. `watcher.debounce_ms`.
+        /// Dotted key path, e.g. `watcher.ignore_extra`.
         key: String,
     },
     /// Set a value (dotted key) in the user-level config.
     Set {
-        /// Dotted key path, e.g. `watcher.debounce_ms`.
+        /// Dotted key path, e.g. `watcher.ignore_extra`.
         key: String,
         /// Value as a string; parsed as TOML (so `250` is an int, `"x"` a string).
         value: String,
@@ -316,19 +316,19 @@ mod tests {
     #[test]
     fn set_then_get_key() {
         let mut doc = Config::default_toml().parse::<DocumentMut>().unwrap();
-        set_key(&mut doc, "watcher.debounce_ms", "250").unwrap();
+        set_key(&mut doc, "tui.syntax_theme", "\"Dracula\"").unwrap();
         // Round-trip via the parser.
         let cfg: Config = toml::from_str(&doc.to_string()).unwrap();
-        assert_eq!(cfg.watcher.debounce_ms, 250);
+        assert_eq!(cfg.tui.syntax_theme, "Dracula");
     }
 
     #[test]
     fn unset_removes_key() {
         let mut doc = Config::default_toml().parse::<DocumentMut>().unwrap();
-        set_key(&mut doc, "watcher.debounce_ms", "999").unwrap();
-        unset_key(&mut doc, "watcher.debounce_ms").unwrap();
+        set_key(&mut doc, "tui.syntax_theme", "\"Dracula\"").unwrap();
+        unset_key(&mut doc, "tui.syntax_theme").unwrap();
         // After unset, the key shouldn't be present.
-        assert!(doc["watcher"].get("debounce_ms").is_none());
+        assert!(doc["tui"].get("syntax_theme").is_none());
     }
 
     #[test]
@@ -355,6 +355,9 @@ mod tests {
     #[test]
     fn set_invalid_value_errors() {
         let mut doc = Config::default_toml().parse::<DocumentMut>().unwrap();
-        assert!(set_key(&mut doc, "watcher.debounce_ms", "not-a-number").is_err());
+        // Setting an integer key with a non-integer value errors at parse time.
+        // We don't have a numeric field on the post-removal Config, so use
+        // a malformed array as the failure case.
+        assert!(set_key(&mut doc, "watcher.ignore_extra", "not-an-array").is_err());
     }
 }

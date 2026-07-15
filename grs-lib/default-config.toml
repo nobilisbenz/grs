@@ -3,8 +3,6 @@
 #          < this file < CLI flags. Right wins on scalars.
 
 [watcher]
-# Milliseconds to collapse bursts of save events into one snap.
-debounce_ms = 1500
 # Extra ignore patterns appended to .grsignore.
 ignore_extra = []
 
