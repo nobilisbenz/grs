@@ -109,7 +109,7 @@ impl From<GrsError> for CommandError {
             GrsError::AmbiguousId(s) => CommandError::user_error(format!(
                 "id \"{s}\" matched multiple sessions"
             ))
-            .hinted("Use more characters of the ULID to disambiguate."),
+            .hinted("Use more characters of the name or id to disambiguate."),
             GrsError::Config(s) => CommandError::user_error(s),
             GrsError::Ignore(s) => CommandError::user_error(s),
             GrsError::UnsupportedVersion(v) => CommandError::user_error(format!(
@@ -119,11 +119,22 @@ impl From<GrsError> for CommandError {
             GrsError::SessionOpen(id) => CommandError::user_error(format!(
                 "session {id} is still open"
             ))
-            .hinted("Run `grs new` to start a new session and close the current one first."),
-            GrsError::Io(e) | GrsError::SnapIo(e) => {
-                CommandError::user_error_with_message("io error", e)
-            }
+            .hinted("Quit the TUI to close it, then `grs session rm <name>`."),
+            GrsError::NameInUse(name) => CommandError::user_error(format!(
+                "session name \"{name}\" is already in use"
+            ))
+            .hinted("Pick a different name, or `grs session rename` the existing one."),
+            GrsError::InvalidName(name) => CommandError::user_error(format!(
+                "invalid session name: \"{name}\""
+            ))
+            .hinted("Names must be non-empty."),
+            GrsError::AlreadyRunning(detail) => CommandError::user_error(format!(
+                "another TUI is already running on this project ({detail})"
+            ))
+            .hinted("Quit the other TUI first, or wait for it to exit."),
+            GrsError::Io(e) => CommandError::user_error_with_message("io error", e),
             GrsError::Json(e) => CommandError::user_error_with_message("json error", e),
+            GrsError::Toml(e) => CommandError::user_error_with_message("toml error", e),
         }
     }
 }

@@ -1,13 +1,66 @@
-//! TUI theme: colors for syntax, diff overlay, and chrome.
+//! Theme / styles for the TUI.
 
-use ratatui::style::Color;
+use ratatui::style::{Color, Modifier, Style};
 
-/// Diff overlay backgrounds — bg tint only, syntax foreground stays readable.
-pub const ADDED_BG: Color = Color::Rgb(20, 80, 30);  // vibrant green for added lines
-pub const REMOVED_BG: Color = Color::Rgb(100, 25, 25);  // vibrant red for removed lines
-pub const SCRUBBER_BG: Color = Color::Rgb(30, 30, 45);
-pub const STATUS_BG: Color = Color::Rgb(20, 20, 30);
-pub const STATUS_FG: Color = Color::Rgb(200, 200, 200);
-pub const ACCENT: Color = Color::Rgb(100, 200, 255);
-pub const MUTED: Color = Color::Rgb(100, 100, 120);
-pub const WARNING: Color = Color::Rgb(255, 180, 80);
+#[derive(Clone, Copy, Debug)]
+pub struct Theme;
+
+impl Default for Theme {
+    fn default() -> Self {
+        Theme
+    }
+}
+
+impl Theme {
+    pub fn normal(&self) -> Style {
+        Style::default()
+    }
+    pub fn muted(&self) -> Style {
+        Style::default().fg(Color::DarkGray)
+    }
+    pub fn border(&self) -> Style {
+        Style::default().fg(Color::DarkGray)
+    }
+    pub fn title(&self) -> Style {
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
+    }
+    pub fn status_bar(&self) -> Style {
+        Style::default().bg(Color::DarkGray)
+    }
+    pub fn status_title(&self) -> Style {
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
+    }
+    pub fn status_hint(&self) -> Style {
+        Style::default().fg(Color::Gray)
+    }
+    pub fn selected(&self) -> Style {
+        Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD)
+    }
+    pub fn snap_number(&self) -> Style {
+        Style::default().fg(Color::Yellow)
+    }
+    pub fn timestamp(&self) -> Style {
+        Style::default().fg(Color::DarkGray)
+    }
+    pub fn added(&self) -> Style {
+        Style::default().fg(Color::Green)
+    }
+    pub fn removed(&self) -> Style {
+        Style::default().fg(Color::Red)
+    }
+    pub fn added_line_no(&self) -> Style {
+        Style::default().fg(Color::LightGreen)
+    }
+    pub fn removed_line_no(&self) -> Style {
+        Style::default().fg(Color::LightRed)
+    }
+    pub fn file_header(&self) -> Style {
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
+    }
+}

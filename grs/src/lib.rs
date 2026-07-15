@@ -5,6 +5,7 @@ pub mod command_error;
 pub mod commands;
 pub mod tui;
 pub mod ui;
+pub mod warnings;
 
 use std::path::PathBuf;
 

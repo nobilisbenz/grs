@@ -31,7 +31,7 @@ pub struct TuiConfig {
 }
 
 fn default_debounce_ms() -> u64 {
-    180
+    1500
 }
 fn default_syntax_theme() -> String {
     "base16-eighties.dark".to_string()
@@ -40,7 +40,7 @@ fn default_syntax_theme() -> String {
 impl Default for WatcherConfig {
     fn default() -> Self {
         Self {
-            debounce_ms: 180,
+            debounce_ms: 1500,
             ignore_extra: Vec::new(),
         }
     }
@@ -156,14 +156,14 @@ mod tests {
     #[test]
     fn defaults() {
         let c = Config::default();
-        assert_eq!(c.watcher.debounce_ms, 180);
+        assert_eq!(c.watcher.debounce_ms, 1500);
     }
 
     #[test]
     fn load_missing_is_defaults() {
         let dir = tempdir().unwrap();
         let c = Config::load_repo(dir.path()).unwrap();
-        assert_eq!(c.watcher.debounce_ms, 180);
+        assert_eq!(c.watcher.debounce_ms, 1500);
     }
 
     #[test]

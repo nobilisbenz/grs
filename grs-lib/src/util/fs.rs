@@ -24,7 +24,7 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     tmp.write_all(bytes)?;
     tmp.as_file().sync_all()?;
     // `persist` renames atomically; refuse to clobber an existing target.
-    tmp.persist(path).map_err(|e| crate::error::GrsError::SnapIo(e.error))?;
+    tmp.persist(path).map_err(|e| crate::error::GrsError::Io(e.error))?;
     Ok(())
 }
 

@@ -1,24 +1,30 @@
-//! Top-level clap command enum + explicit `match` dispatch.
-//! Every leaf command has the universal signature:
-//! `async fn cmd_x(ui, command, args) -> Result<(), CommandError>`.
+//! Top-level clap command enum + dispatch.
 //!
-//! `grs` is a minimal TUI replay tool. Running it with no subcommand opens
-//! the replay for the current session. Capture runs only while the TUI is
-//! running in a terminal.
+//! Bare `grs` opens the TUI shell. Subcommands:
+//!
+//! - `grs session list`        list all sessions in the project
+//! - `grs session view <name>` open a read-only TUI of an ended session
+//! - `grs session rename`      rename a session
+//! - `grs session rm`          delete a closed session's folder
+//! - `grs new <name>`          finalize current open session, start a new one
+//! - `grs completions <shell>` generate shell completions
+//! - `grs man`                 generate man page
+//! - `grs config`              view/edit layered config
 
-use crate::command_error::CommandError;
 use crate::cli_util::CommandHelper;
+use crate::command_error::CommandError;
 use crate::ui::Ui;
 
 pub mod completions;
 pub mod config;
 pub mod new;
+pub mod session;
 
 #[derive(clap::Parser, Clone, Debug)]
 #[command(
     name = "grs",
     version,
-    about = "Code review over a session's file edits",
+    about = "grs — watch your project grow, one snap at a time",
     long_about = None,
 )]
 pub struct Args {
@@ -32,25 +38,33 @@ pub struct Args {
 pub enum Command {
     /// Finalize the current open session and start a new one.
     New(new::NewArgs),
-    /// Generate a shell completion script (bash, zsh, fish, elvish, powershell).
+    /// Manage sessions (list, view, rename, remove).
+    #[command(subcommand)]
+    Session(session::SessionCmd),
+    /// Generate a shell completion script.
     Completions(completions::CompletionsArgs),
     /// Generate a man page (roff) for the `grs` command.
     Man,
-    /// View and edit the layered grs config (user / repo / effective).
+    /// View and edit the layered grs config.
     Config(config::ConfigArgs),
 }
 
-pub async fn run_command(ui: &mut Ui, command: &CommandHelper, args: &Args) -> Result<(), CommandError> {
+pub async fn run_command(
+    ui: &mut Ui,
+    command: &CommandHelper,
+    args: &Args,
+) -> Result<(), CommandError> {
     let cmd = match &args.command {
         Some(c) => c,
         None => {
-            // No subcommand: open the TUI shell at the session list.
+            // No subcommand: open the TUI shell.
             let store = command.store_or_init().map_err(CommandError::from)?;
             return crate::tui::run_tui(store);
         }
     };
     match cmd {
         Command::New(a) => new::cmd_new(ui, command, a).await,
+        Command::Session(s) => session::run(ui, command, s).await,
         Command::Completions(a) => completions::cmd_completions(a),
         Command::Config(a) => config::cmd_config(ui, command, a).await,
         Command::Man => completions::cmd_man(),

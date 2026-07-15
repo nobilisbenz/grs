@@ -4,7 +4,7 @@ use std::fmt;
 /// A session id newtype over a [`ulid::Ulid`].
 ///
 /// ULIDs are 26-char, lexicographically-sortable by time, so `sessions/` dirs
-/// sort chronologically for free (see `plan/02-storage-format.md`).
+/// sort chronologically for free.
 #[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct SessionId(pub ulid::Ulid);
 
@@ -24,6 +24,11 @@ impl SessionId {
         ulid::Ulid::from_string(s)
             .map(Self)
             .map_err(|e| GrsError::NotFound(format!("invalid session id \"{s}\": {e}")))
+    }
+
+    /// Build the on-disk folder name for a session: `<slug>_<ulid>`.
+    pub fn folder_name(slug: &str, id: &SessionId) -> String {
+        format!("{slug}_{id}", id = id.as_str())
     }
 }
 
@@ -75,8 +80,6 @@ mod tests {
 
     #[test]
     fn sorts_chronologically() {
-        // ULIDs generated later sort after earlier ones (within the same ms the
-        // crate guarantees monotonic random-tail increment).
         let a = SessionId::new();
         std::thread::sleep(std::time::Duration::from_millis(2));
         let b = SessionId::new();
@@ -86,5 +89,12 @@ mod tests {
     #[test]
     fn parse_rejects_garbage() {
         assert!(SessionId::parse("not-a-ulid").is_err());
+    }
+
+    #[test]
+    fn folder_name_format() {
+        // Real Crockford-base32 ULID, 26 chars.
+        let id = SessionId::parse("01HXYZABCDEFGHJKMNPQRSTVWX").unwrap();
+        assert_eq!(SessionId::folder_name("refactor", &id), "refactor_01HXYZABCDEFGHJKMNPQRSTVWX");
     }
 }

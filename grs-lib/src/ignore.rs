@@ -17,7 +17,8 @@ node_modules/\n\
 target/\n\
 dist/\n\
 build/\n\
-.grs/\n";
+.grs/\n\
+.grsignore\n";
 
 pub struct IgnoreMatcher {
     root: PathBuf,
@@ -30,6 +31,11 @@ impl IgnoreMatcher {
             root: root.to_path_buf(),
             extra_patterns: extra_patterns.to_vec(),
         })
+    }
+
+    /// The repo root this matcher is rooted at.
+    pub fn root(&self) -> &Path {
+        &self.root
     }
 
     /// Is `path` (absolute or repo-relative) ignored?
@@ -46,9 +52,6 @@ impl IgnoreMatcher {
             Some(m) => m,
             None => return false,
         };
-        // Check the path itself plus each ancestor directory: a file is
-        // ignored if it matches OR any parent dir matches (gitignore
-        // semantics — `target/` ignores `target/anything`).
         let rel_path = std::path::Path::new(&rel);
         let comps: Vec<_> = rel_path.components().collect();
         let mut acc = PathBuf::new();
@@ -94,11 +97,9 @@ impl IgnoreMatcher {
         builder.build().ok()
     }
 
-    /// Iterate over all non-ignored files in the tree (used by `grs add` and
-    /// the foreground watcher's initial scan). Yields absolute paths. Prunes
-    /// the common heavy ignored dirs by name so we don't descend into
-    /// `target/` etc., then post-filters each file with `is_ignored` for full
-    /// correctness.
+    /// Iterate over all non-ignored files in the tree. Yields absolute paths.
+    /// Prunes the common heavy ignored dirs by name so we don't descend into
+    /// `target/` etc., then post-filters each file with `is_ignored`.
     pub fn files(&self) -> Vec<PathBuf> {
         let mut builder = WalkBuilder::new(&self.root);
         builder
@@ -145,14 +146,17 @@ impl IgnoreMatcher {
 fn ancestors_from(stop: &Path, from: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let mut cur = from.to_path_buf();
-    while cur != stop.parent().unwrap_or(stop) && cur.starts_with(stop) {
+    while cur.starts_with(stop) {
         out.push(cur.clone());
         match cur.parent() {
-            Some(p) if p == stop || p.starts_with(stop) => cur = p.to_path_buf(),
+            Some(p) if p == stop || (stop.parent().is_some() && p == stop.parent().unwrap()) => {
+                cur = p.to_path_buf()
+            }
+            Some(p) if p.starts_with(stop) => cur = p.to_path_buf(),
             _ => break,
         }
     }
-    out.reverse(); // root first
+    out.reverse();
     out
 }
 
@@ -166,6 +170,7 @@ mod tests {
         let dir = tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join(".grs")).unwrap();
         let m = IgnoreMatcher::new(dir.path(), &[]).unwrap();
+        assert_eq!(m.root(), dir.path());
         assert!(m.is_ignored(&dir.path().join(".grs/config.toml")));
         assert!(m.is_ignored(&dir.path().join(".grs")));
     }

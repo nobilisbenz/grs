@@ -1,20 +1,22 @@
 //! Foreground file watcher used by the TUI.
 //!
-//! The watcher is started inside the `grs` / `grs replay` process. It dies
-//! automatically when the TUI closes because the TUI owns the watcher thread
-//! and signals it to stop on drop.
+//! The watcher is started inside the TUI process. It dies when the TUI
+//! closes because the TUI owns the watcher thread and signals it to stop
+//! on drop.
+//!
+//! In the per-project snapshot model, the watcher is simple: any debounced
+//! batch of filesystem events triggers a single full-project snap. There
+//! is no per-file chain — every save is a checkpoint of the whole tree.
 
 use crate::config::Config;
 use crate::error::Result;
+use crate::ignore::IgnoreMatcher;
 use crate::paths::GrsPaths;
+use crate::snap::SnapStore;
 use crate::store::RepoStore;
 use crate::ulid::SessionId;
-use crate::util::time::now_ms;
 use notify::{RecursiveMode, Watcher as NotifyWatcher};
-use notify_debouncer_full::{
-    new_debouncer, DebounceEventResult, DebouncedEvent, Debouncer, FileIdMap,
-};
-use std::collections::HashMap;
+use notify_debouncer_full::{new_debouncer, DebounceEventResult, Debouncer, FileIdMap};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::Duration;
@@ -23,9 +25,7 @@ use tracing::{debug, info, warn};
 /// Reason the watcher stopped.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StopReason {
-    /// The TUI sent a stop signal.
     StopRequested,
-    /// Watcher channel disconnected.
     Disconnected,
 }
 
@@ -58,34 +58,16 @@ impl Watcher {
     fn run_inner(self, stop: &mpsc::Receiver<()>) -> Result<()> {
         let Watcher {
             root,
-            mut store,
+            store,
             config,
             paths: _,
         } = self;
 
-        // Resolve the open session from HEAD. If missing, create one.
-        let mut open_session = match store.head()? {
-            Some(id) => id,
-            None => {
-                let s = store.sessions().create_new(now_ms())?;
-                store.set_head(&s.id)?;
-                s.id
-            }
-        };
-
-        // Build the initial state: last_content + per-file last_seq by
-        // replaying the current session's snaps.
-        let mut last_content: HashMap<String, String> = HashMap::new();
-        let mut file_last_seq: HashMap<String, u32> = HashMap::new();
-        for entry in store.snaps().list(&open_session)? {
-            match crate::snap::SnapStore::read_path(&entry.path) {
-                Ok(snap) => {
-                    file_last_seq.insert(snap.file_path.clone(), snap.seq);
-                    last_content.insert(snap.file_path, snap.content);
-                }
-                Err(e) => warn!(?e, "failed to read snap during init"),
-            }
-        }
+        // Resolve the open session from HEAD. If missing, error — the caller
+        // is expected to have created a session before starting the watcher.
+        let open_session = store
+            .current_session_id()?
+            .ok_or_else(|| crate::error::GrsError::NotFound("no open session".to_string()))?;
 
         // Set up the notify watcher (debounced).
         let (tx, rx) = mpsc::channel::<DebounceEventResult>();
@@ -100,12 +82,10 @@ impl Watcher {
             .map_err(|e| crate::error::GrsError::Ignore(format!("watch failed: {e}")))?;
         let _ = debouncer.cache();
 
-        info!(watch_root = %root.display(), "grs watcher starting");
+        info!(watch_root = %root.display(), debounce_ms = config.watcher.debounce_ms, "grs watcher starting");
 
-        // Main event loop.
-        let mut last_head_check: u64 = 0;
-        let mut last_ignore_check: u64 = 0;
-        let mut ignore_matcher = store.ignore_matcher()?;
+        let ignore_matcher = store.ignore_matcher()?;
+        let snap_store = store.snaps();
         let stop_reason: StopReason;
 
         loop {
@@ -117,22 +97,15 @@ impl Watcher {
                 break;
             }
 
-            match rx.recv_timeout(Duration::from_millis(200)) {
+            match rx.recv_timeout(Duration::from_millis(500)) {
                 Ok(Ok(events)) => {
-                    for ev in events {
-                        for path in &ev.paths {
-                            if let Err(e) = handle_path_event(
-                                path,
-                                &root,
-                                &ignore_matcher,
-                                &open_session,
-                                &mut last_content,
-                                &mut file_last_seq,
-                                &mut store,
-                            ) {
-                                warn!(?e, path = %path.display(), "event handler error");
-                            }
-                        }
+                    if events.is_empty() {
+                        continue;
+                    }
+                    // Any debounced batch = one full-project snap.
+                    debug!(event_count = events.len(), "capturing snap from debounced batch");
+                    if let Err(e) = capture_one(&store, &open_session, &snap_store, &ignore_matcher) {
+                        warn!(?e, "snap capture failed");
                     }
                 }
                 Ok(Err(errs)) => {
@@ -146,30 +119,6 @@ impl Watcher {
                     break;
                 }
             }
-
-            let tick_ms = now_ms() as u64;
-            if tick_ms - last_head_check > 250 {
-                last_head_check = tick_ms;
-                if let Some(new_head) = store.head()? {
-                    if new_head != open_session {
-                        info!(from = %open_session, to = %new_head, "HEAD changed; switching session");
-                        open_session = new_head;
-                        last_content.clear();
-                        file_last_seq.clear();
-                        for entry in store.snaps().list(&open_session).unwrap_or_default() {
-                            if let Ok(snap) = crate::snap::SnapStore::read_path(&entry.path) {
-                                file_last_seq.insert(snap.file_path.clone(), snap.seq);
-                                last_content.insert(snap.file_path, snap.content);
-                            }
-                        }
-                    }
-                }
-            }
-
-            if tick_ms - last_ignore_check > 1000 {
-                last_ignore_check = tick_ms;
-                let _ = reload_ignore(&root, &config, &mut ignore_matcher);
-            }
         }
 
         info!(?stop_reason, "grs watcher exiting");
@@ -177,115 +126,17 @@ impl Watcher {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn handle_path_event(
-    path: &Path,
-    root: &Path,
-    ignore: &crate::ignore::IgnoreMatcher,
+fn capture_one(
+    store: &RepoStore,
     open_session: &SessionId,
-    last_content: &mut HashMap<String, String>,
-    file_last_seq: &mut HashMap<String, u32>,
-    store: &mut RepoStore,
+    snap_store: &SnapStore,
+    ignore: &IgnoreMatcher,
 ) -> Result<()> {
-    if ignore.is_ignored(path) {
-        return Ok(());
-    }
-    let rel = crate::paths::relativize(root, path);
-    if rel.is_empty() || rel == ".grs" || rel.starts_with(".grs/") {
-        return Ok(());
-    }
-    if path.is_dir() {
-        return Ok(());
-    }
-
-    if !path.exists() {
-        // File deleted — record a tombstone snap only if we used to track it.
-        // For files we had been ignoring as binary, `last_content` was never
-        // populated, so this is a no-op for them.
-        let prev = last_content.remove(&rel);
-        let prev_seq = file_last_seq.remove(&rel);
-        if let Some(prev_content) = prev {
-            let diff = crate::diff::line_diff(&prev_content, "");
-            let mut diff = diff;
-            diff.prev_seq = prev_seq;
-            let seq = next_seq(store, open_session);
-            let mut snap = crate::snap::SnapStore::build_snap(
-                seq,
-                rel.clone(),
-                String::new(),
-                diff,
-                prev_seq,
-            );
-            snap.timestamp = now_ms();
-            snap.timestamp_iso = crate::util::time::iso(snap.timestamp);
-            store.snaps().write(open_session, snap)?;
-            crate::store::update_session_counts(store, open_session)?;
-        }
-        return Ok(());
-    }
-
-    // Skip binary content entirely — no snap, no diff. A built `cargo`
-    // artifact or compiled `.pyc` would otherwise spam the session with
-    // `(binary file, N bytes)` placeholders on every recompile. Also drop
-    // any stale state for the path so a transient text→binary→text flip
-    // (rare but possible) starts clean.
-    if crate::util::fs::is_binary_file(path) {
-        last_content.remove(&rel);
-        file_last_seq.remove(&rel);
-        debug!(file = %rel, "skipping binary file");
-        return Ok(());
-    }
-
-    let new_content = crate::util::fs::read_content_or_binary_placeholder(path)?;
-    let prev_content = last_content.get(&rel).cloned();
-
-    // Dedup: editors sometimes fire Modify-after-Create for the same write.
-    // If the content hasn't actually changed, skip the snap.
-    if let Some(prev) = &prev_content {
-        if prev == &new_content {
-            return Ok(());
-        }
-    }
-
-    let prev_seq = file_last_seq.get(&rel).copied();
-    let diff = crate::diff::line_diff(prev_content.as_deref().unwrap_or(""), &new_content);
-    let mut diff = diff;
-    diff.prev_seq = prev_seq;
-    let seq = next_seq(store, open_session);
-    let mut snap = crate::snap::SnapStore::build_snap(
-        seq,
-        rel.clone(),
-        new_content.clone(),
-        diff,
-        prev_seq,
-    );
-    snap.timestamp = now_ms();
-    snap.timestamp_iso = crate::util::time::iso(snap.timestamp);
-    store.snaps().write(open_session, snap)?;
-    crate::store::update_session_counts(store, open_session)?;
-
-    last_content.insert(rel.clone(), new_content);
-    file_last_seq.insert(rel, seq);
-    debug!(seq, "snap written");
-    Ok(())
-}
-
-/// Allocate the next globally-unique seq for `session`. `prev_for_file`
-/// stays in the per-file `prev_seq` field on the snap (so the diff chain
-/// remains correct), but the snap's own `seq` must be a session-wide
-/// monotonic counter — otherwise two different files can both land on
-/// seq `n`, and a "play by seq" sort interleaves them in filesystem
-/// order rather than the real time order the user expects.
-fn next_seq(store: &RepoStore, session: &SessionId) -> u32 {
-    store.snaps().next_seq(session).unwrap_or(0)
-}
-
-fn reload_ignore(
-    root: &Path,
-    config: &Config,
-    matcher: &mut crate::ignore::IgnoreMatcher,
-) -> Result<()> {
-    *matcher = crate::ignore::IgnoreMatcher::new(root, &config.watcher.ignore_extra)?;
+    let meta = snap_store.capture(open_session, ignore)?;
+    store
+        .sessions()
+        .update_snap_count(open_session, meta.n)?;
+    debug!(n = meta.n, files = meta.file_count, "snap captured");
     Ok(())
 }
 
@@ -298,223 +149,76 @@ pub fn run_for(root: &Path, stop: &mpsc::Receiver<()>) -> Result<()> {
 // Re-export for tests / external callers.
 pub use notify_debouncer_full::DebouncedEvent as Event;
 
-#[allow(dead_code)]
-fn _unused(_: &DebouncedEvent) {}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::store::RepoStore;
-    use std::collections::HashMap;
+    use std::io::Write;
+    use std::sync::mpsc;
     use tempfile::tempdir;
 
+    /// Drive a single debounced flush through the watcher's batch handler
+    /// and assert a snap was created.
     #[test]
-    fn handle_path_event_writes_snap_then_updates_state() {
+    fn debounced_batch_creates_snap() {
         let dir = tempdir().unwrap();
-        let mut store = RepoStore::init(dir.path()).unwrap();
-        let head = store.head().unwrap().unwrap();
-        let target = dir.path().join("a.txt");
-        std::fs::write(&target, "hello\n").unwrap();
-
-        let mut last_content: HashMap<String, String> = HashMap::new();
-        let mut file_last_seq: HashMap<String, u32> = HashMap::new();
+        let store = RepoStore::init(dir.path()).unwrap();
+        // init() does not create a session; we create one explicitly.
+        let s = store.open_first_session("test".into()).unwrap();
+        let head = s.id.clone();
+        // init() already captured snap 1; add a new file and capture snap 2.
         let ignore = store.ignore_matcher().unwrap();
-
-        handle_path_event(
-            &target,
-            dir.path(),
-            &ignore,
-            &head,
-            &mut last_content,
-            &mut file_last_seq,
-            &mut store,
-        )
-        .unwrap();
-
-        assert_eq!(file_last_seq.get("a.txt").copied(), Some(0));
-        assert_eq!(last_content.get("a.txt").map(|s| s.as_str()), Some("hello\n"));
-        let snap = store.snaps().read(&head, 0).unwrap();
-        assert_eq!(snap.content, "hello\n");
-        assert_eq!(snap.prev_seq, None);
-        assert_eq!(snap.diff.added_lines, vec![1]);
-
-        // Modify: should produce snap 1 with prev_seq=0 and the right diff.
-        std::fs::write(&target, "hello world\n").unwrap();
-        handle_path_event(
-            &target,
-            dir.path(),
-            &ignore,
-            &head,
-            &mut last_content,
-            &mut file_last_seq,
-            &mut store,
-        )
-        .unwrap();
-        assert_eq!(file_last_seq.get("a.txt").copied(), Some(1));
-        let snap = store.snaps().read(&head, 1).unwrap();
-        assert_eq!(snap.prev_seq, Some(0));
-        assert_eq!(snap.content, "hello world\n");
+        let snap_store = store.snaps();
+        std::fs::write(dir.path().join("a.txt"), "hello\n").unwrap();
+        let meta = snap_store.capture(&head, &ignore).unwrap();
+        assert!(meta.n >= 2, "expected snap >= 2, got {}", meta.n);
+        assert!(store.paths().snap_dir(&head, meta.n).join("a.txt").is_file());
     }
 
     #[test]
-    fn handle_path_event_skips_ignored() {
+    fn watcher_init_fails_without_open_session() {
         let dir = tempdir().unwrap();
-        let mut store = RepoStore::init(dir.path()).unwrap();
-        let head = store.head().unwrap().unwrap();
-        let target = dir.path().join("a.log");
-        std::fs::write(&target, "noise\n").unwrap();
-        std::fs::write(dir.path().join(".grsignore"), "*.log\n").unwrap();
-
-        let mut last_content: HashMap<String, String> = HashMap::new();
-        let mut file_last_seq: HashMap<String, u32> = HashMap::new();
-        let ignore = store.ignore_matcher().unwrap();
-
-        handle_path_event(
-            &target,
-            dir.path(),
-            &ignore,
-            &head,
-            &mut last_content,
-            &mut file_last_seq,
-            &mut store,
-        )
-        .unwrap();
-        assert!(file_last_seq.is_empty());
-        assert_eq!(store.snaps().list(&head).unwrap().len(), 0);
+        let store = RepoStore::init(dir.path()).unwrap();
+        // No open session was created.
+        let (tx, rx) = mpsc::channel();
+        drop(tx);
+        let res = Watcher::new(store).run(&rx);
+        assert!(res.is_err(), "watcher must fail without an open session");
     }
 
+    // End-to-end: start the watcher, modify a file, verify a snap is captured.
     #[test]
-    fn handle_path_event_skips_binary() {
+    fn end_to_end_captures_snap_on_save() {
         let dir = tempdir().unwrap();
-        let mut store = RepoStore::init(dir.path()).unwrap();
-        let head = store.head().unwrap().unwrap();
-        // Pretend compiled binary: header + lots of NULs.
-        let mut bytes = vec![0x7f, b'E', b'L', b'F', 0x02, 0x01, 0x01, 0x00];
-        bytes.extend(std::iter::repeat(0u8).take(1024));
-        let target = dir.path().join("artifact.bin");
-        std::fs::write(&target, &bytes).unwrap();
+        let store = RepoStore::init(dir.path()).unwrap();
+        let s = store.open_first_session("watch-e2e".into()).unwrap();
+        let session_id = s.id.clone();
+        let initial = store.snaps().count(&session_id).unwrap();
 
-        let mut last_content: HashMap<String, String> = HashMap::new();
-        let mut file_last_seq: HashMap<String, u32> = HashMap::new();
-        let ignore = store.ignore_matcher().unwrap();
-
-        handle_path_event(
-            &target,
-            dir.path(),
-            &ignore,
-            &head,
-            &mut last_content,
-            &mut file_last_seq,
-            &mut store,
-        )
-        .unwrap();
-        assert!(file_last_seq.is_empty(), "binary must not be tracked");
-        assert!(last_content.is_empty());
-        assert_eq!(store.snaps().list(&head).unwrap().len(), 0);
+        let (stop_tx, stop_rx) = mpsc::channel();
+        let watcher_store = store.clone();
+        let handle = std::thread::spawn(move || {
+            let _ = Watcher::new(watcher_store).run(&stop_rx);
+        });
+        // Settle.
+        std::thread::sleep(Duration::from_millis(200));
+        // Write a new file. The 1.5s debounce will fire; give it a margin.
+        std::fs::write(dir.path().join("new.txt"), "hello\n").unwrap();
+        std::thread::sleep(Duration::from_millis(2500));
+        let after = store.snaps().count(&session_id).unwrap();
+        assert!(
+            after > initial,
+            "watcher should have captured at least one new snap (initial={initial}, after={after})"
+        );
+        // Snap N (or higher) should contain new.txt.
+        let snap = store.snaps().read_meta(&session_id, after).unwrap();
+        let has_new = snap.files.iter().any(|f| f.path == "new.txt");
+        assert!(has_new, "new.txt should be in the latest snap");
+        stop_tx.send(()).ok();
+        let _ = handle.join();
     }
 
-    #[test]
-    fn handle_path_event_drops_stale_state_for_now_binary_file() {
-        let dir = tempdir().unwrap();
-        let mut store = RepoStore::init(dir.path()).unwrap();
-        let head = store.head().unwrap().unwrap();
-        let target = dir.path().join("a.txt");
-        // First we write text and snap it.
-        std::fs::write(&target, "hello\n").unwrap();
-
-        let mut last_content: HashMap<String, String> = HashMap::new();
-        let mut file_last_seq: HashMap<String, u32> = HashMap::new();
-        let ignore = store.ignore_matcher().unwrap();
-
-        handle_path_event(
-            &target,
-            dir.path(),
-            &ignore,
-            &head,
-            &mut last_content,
-            &mut file_last_seq,
-            &mut store,
-        )
-        .unwrap();
-        assert_eq!(file_last_seq.get("a.txt").copied(), Some(0));
-        assert_eq!(last_content.get("a.txt").map(|s| s.as_str()), Some("hello\n"));
-
-        // Now the file becomes binary (e.g. some build step overwrites it).
-        let mut bytes = vec![0u8; 256];
-        bytes[0] = 0x7f;
-        std::fs::write(&target, &bytes).unwrap();
-        handle_path_event(
-            &target,
-            dir.path(),
-            &ignore,
-            &head,
-            &mut last_content,
-            &mut file_last_seq,
-            &mut store,
-        )
-        .unwrap();
-        // Stale state must be cleared; no second snap should be written.
-        assert!(!file_last_seq.contains_key("a.txt"));
-        assert!(!last_content.contains_key("a.txt"));
-        assert_eq!(store.snaps().list(&head).unwrap().len(), 1);
-    }
-
-    #[test]
-    fn handle_path_event_uses_global_seq_across_files() {
-        // Reproduces the bug the timelapse "file-specific" order was caused
-        // by: a -> b -> a produced seqs 0, 1, 1 in the old per-file scheme
-        // (collision on the second `a`). The new global scheme must hand
-        // out 0, 1, 2 so a `sort_by_key(|e| e.seq)` truly gives time order.
-        let dir = tempdir().unwrap();
-        let mut store = RepoStore::init(dir.path()).unwrap();
-        let head = store.head().unwrap().unwrap();
-        let a = dir.path().join("a.txt");
-        let b = dir.path().join("b.txt");
-
-        let mut last_content: HashMap<String, String> = HashMap::new();
-        let mut file_last_seq: HashMap<String, u32> = HashMap::new();
-        let ignore = store.ignore_matcher().unwrap();
-
-        // Each edit changes the file's content so the watcher's
-        // content-dedup doesn't suppress it. Order matches a real session
-        // where the user bounces between two files.
-        let edits: &[(&std::path::Path, &str)] = &[
-            (&a, "a1\n"),
-            (&b, "b1\n"),
-            (&a, "a2\n"),
-        ];
-        for (path, content) in edits {
-            std::fs::write(path, content).unwrap();
-            handle_path_event(
-                path,
-                dir.path(),
-                &ignore,
-                &head,
-                &mut last_content,
-                &mut file_last_seq,
-                &mut store,
-            )
-            .unwrap();
-        }
-        let seqs: Vec<u32> = store
-            .snaps()
-            .list(&head)
-            .unwrap()
-            .into_iter()
-            .map(|e| e.seq)
-            .collect();
-        assert_eq!(seqs, vec![0, 1, 2], "seqs must be globally unique");
-        let files: Vec<String> = store
-            .snaps()
-            .list(&head)
-            .unwrap()
-            .into_iter()
-            .map(|e| {
-                crate::snap::SnapStore::read_path(&e.path)
-                    .unwrap()
-                    .file_path
-            })
-            .collect();
-        assert_eq!(files, vec!["a.txt", "b.txt", "a.txt"]);
-    }
+    // Stub for callers that need a Write handle to flush test fixtures.
+    #[allow(dead_code)]
+    fn _touch(_w: &mut dyn Write) {}
 }

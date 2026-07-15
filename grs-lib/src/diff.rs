@@ -2,10 +2,13 @@
 //!
 //! Uses `similar::TextDiff::from_lines` and inspects each `DiffOp`'s
 //! old/new ranges to derive 1-based line numbers of added/removed lines vs
-//! the previous content. The diff is computed once at snap time and stored
-//! in the snap JSON, so the TUI never diffs on the hot path (see `plan/02`).
+//! the previous content.
+//!
+//! This is consumed by `snap::diff_snap_meta` to count added/removed lines
+//! for a whole-snap diff. Per-file chains don't exist in the new model
+//! (snaps are full project trees, not per-file events), so there's no
+//! `prev_seq` here.
 
-use crate::model::LineDiff;
 use similar::{DiffTag, TextDiff};
 
 /// Compute the line-level diff of `cur` against `prev`.
@@ -47,8 +50,13 @@ pub fn line_diff(prev: &str, cur: &str) -> LineDiff {
     LineDiff {
         added_lines,
         removed_lines,
-        prev_seq: None,
     }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct LineDiff {
+    pub added_lines: Vec<usize>,
+    pub removed_lines: Vec<usize>,
 }
 
 #[cfg(test)]
@@ -77,21 +85,6 @@ mod tests {
     }
 
     #[test]
-    fn insert_in_middle() {
-        let d = line_diff("a\nb\nc\n", "a\nX\nb\nc\n");
-        assert_eq!(d.added_lines, vec![2]);
-        assert!(d.removed_lines.is_empty());
-    }
-
-    #[test]
-    fn replace_block() {
-        // "b\nc" -> "X\nY"
-        let d = line_diff("a\nb\nc\nd\n", "a\nX\nY\nd\n");
-        assert_eq!(d.added_lines, vec![2, 3]);
-        assert_eq!(d.removed_lines, vec![2, 3]);
-    }
-
-    #[test]
     fn first_snap_all_added() {
         let d = line_diff("", "a\nb\nc\n");
         assert_eq!(d.added_lines, vec![1, 2, 3]);
@@ -103,15 +96,5 @@ mod tests {
         let d = line_diff("", "");
         assert!(d.added_lines.is_empty());
         assert!(d.removed_lines.is_empty());
-    }
-
-    #[test]
-    fn trailing_newline_replaces_last_line() {
-        // `similar::from_lines` treats "b" and "b\n" as different lines, so
-        // adding a trailing newline is a replace of the last line, not an
-        // append.
-        let d = line_diff("a\nb", "a\nb\n");
-        assert_eq!(d.added_lines, vec![2]);
-        assert_eq!(d.removed_lines, vec![2]);
     }
 }

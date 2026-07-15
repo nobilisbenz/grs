@@ -1,10 +1,6 @@
 use thiserror::Error;
 
 /// The single error type for the `grs-lib` engine.
-///
-/// Variants carry enough information for the CLI's `CommandError` to attach
-/// user-facing hints (see `grs/src/command_error.rs`). The CLI maps each
-/// variant to a kind + hint in exactly one place.
 #[derive(Debug, Error)]
 pub enum GrsError {
     #[error("no .grs/ repository found here")]
@@ -16,11 +12,11 @@ pub enum GrsError {
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 
-    #[error("snap io error: {0}")]
-    SnapIo(std::io::Error),
-
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
+
+    #[error("toml error: {0}")]
+    Toml(#[from] toml::de::Error),
 
     #[error("ignore error: {0}")]
     Ignore(String),
@@ -37,8 +33,17 @@ pub enum GrsError {
     #[error("storage version {0} not supported by this grs build")]
     UnsupportedVersion(u32),
 
-    #[error("session {0} is open; close it (e.g. `grs new`) before deleting")]
+    #[error("session name \"{0}\" is already in use")]
+    NameInUse(String),
+
+    #[error("session {0} is open; close it (e.g. quit the TUI) before deleting")]
     SessionOpen(crate::ulid::SessionId),
+
+    #[error("a TUI is already running for this project (lock: {0})")]
+    AlreadyRunning(String),
+
+    #[error("invalid session name: {0}")]
+    InvalidName(String),
 }
 
 pub type Result<T, E = GrsError> = std::result::Result<T, E>;
