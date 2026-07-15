@@ -8,12 +8,12 @@
 use crate::tui::input::KeyAction;
 use crate::tui::theme::{ACCENT, MUTED, SCRUBBER_BG, STATUS_BG, STATUS_FG, WARNING};
 use grs_lib::error::GrsError;
-use grs_lib::model::Session;
+use grs_lib::model::SessionMeta;
 use grs_lib::store::RepoStore;
 use grs_lib::ulid::SessionId;
 use grs_lib::util::time::now_ms;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Frame;
@@ -24,12 +24,12 @@ pub enum ListCmd {
     Stay,
     Quit,
     /// Open the selected session in the code-review view.
-    OpenCodeReview(Session),
+    OpenCodeReview(SessionMeta),
 }
 
 pub struct SessionListState {
     pub store: RepoStore,
-    pub sessions: Vec<Session>,
+    pub sessions: Vec<SessionMeta>,
     pub list_state: ListState,
     /// Id-prefix filter; empty string means "no filter".
     pub filter: String,
@@ -42,6 +42,16 @@ pub struct SessionListState {
     /// the next keypress that mutates the list. Shown briefly in the
     /// status bar.
     pub toast: Option<String>,
+    /// True while the new-session name prompt is showing. The prompt
+    /// buffers chars in `name_buf`.
+    pub new_session_prompt: bool,
+    pub name_buf: String,
+    /// Last error from the new-session name prompt (e.g. "name in use").
+    pub name_error: Option<String>,
+    /// When the prompt is up, on confirm open the new session immediately
+    /// (`N` keystroke); otherwise just rotate and return to the list
+    /// (`n` keystroke).
+    pub _new_and_open_on_confirm: bool,
 }
 
 impl SessionListState {
@@ -60,6 +70,10 @@ impl SessionListState {
             pending_delete: None,
             help_open: false,
             toast: None,
+            new_session_prompt: false,
+            name_buf: String::new(),
+            name_error: None,
+            _new_and_open_on_confirm: false,
         }
     }
 
@@ -84,7 +98,7 @@ impl SessionListState {
 
     /// Sessions matching the current id-prefix filter (or all if filter is
     /// empty), in their stored (newest-first) order.
-    pub fn visible(&self) -> Vec<&Session> {
+    pub fn visible(&self) -> Vec<&SessionMeta> {
         if self.filter.is_empty() {
             return self.sessions.iter().collect();
         }
@@ -94,11 +108,15 @@ impl SessionListState {
             .collect()
     }
 
-    pub fn selected(&self) -> Option<&Session> {
+    pub fn selected(&self) -> Option<&SessionMeta> {
         self.list_state.selected().and_then(|i| self.visible().get(i).copied())
     }
 
     pub fn on_action(&mut self, action: KeyAction) -> ListCmd {
+        // If the new-session prompt is up, route keys there.
+        if self.new_session_prompt {
+            return self.handle_name_prompt(action);
+        }
         // Any non-Delete action cancels a pending delete. (Including filter
         // keys, navigation, etc. — pressing `d` then `j` cancels the
         // pending delete and moves the cursor, which is the obvious UX.)
@@ -133,27 +151,13 @@ impl SessionListState {
                 }
             }
             KeyAction::NewSession | KeyAction::NewSessionAndOpen => {
-                match self.store.rotate_open_session(now_ms()) {
-                    Ok(new_session) => {
-                        self.refresh();
-                        // Place the cursor on the new session.
-                        if let Some(idx) =
-                            self.visible().iter().position(|s| s.id == new_session.id)
-                        {
-                            self.list_state.select(Some(idx));
-                        }
-                        self.toast = Some(format!("new session {}", short_id(&new_session.id)));
-                        if matches!(action, KeyAction::NewSessionAndOpen) {
-                            ListCmd::OpenCodeReview(new_session)
-                        } else {
-                            ListCmd::Stay
-                        }
-                    }
-                    Err(e) => {
-                        self.toast = Some(format!("new failed: {e}"));
-                        ListCmd::Stay
-                    }
-                }
+                // Open a name prompt instead of rotating immediately.
+                self.new_session_prompt = true;
+                self.name_buf.clear();
+                self.name_error = None;
+                self.toast = None;
+                self._new_and_open_on_confirm = matches!(action, KeyAction::NewSessionAndOpen);
+                ListCmd::Stay
             }
             KeyAction::Delete => {
                 let Some(session) = self.selected().cloned() else {
@@ -247,6 +251,64 @@ impl SessionListState {
             _ => ListCmd::Stay,
         }
     }
+
+    /// Handle keys while the new-session name prompt is up. Enter
+    /// confirms; Esc cancels; backspace pops; any char appends.
+    fn handle_name_prompt(&mut self, action: KeyAction) -> ListCmd {
+        match action {
+            KeyAction::CancelFilter | KeyAction::Quit | KeyAction::Back => {
+                self.new_session_prompt = false;
+                self.name_buf.clear();
+                self.name_error = None;
+                self._new_and_open_on_confirm = false;
+                ListCmd::Stay
+            }
+            KeyAction::ConfirmFilter | KeyAction::Enter => {
+                let name = self.name_buf.trim().to_string();
+                if name.is_empty() {
+                    self.name_error = Some("name cannot be empty".to_string());
+                    return ListCmd::Stay;
+                }
+                let now = now_ms();
+                let result = self.store.rotate_open_session(name.clone(), now);
+                self.new_session_prompt = false;
+                self.name_buf.clear();
+                let and_open = self._new_and_open_on_confirm;
+                self._new_and_open_on_confirm = false;
+                match result {
+                    Ok(new_session) => {
+                        self.refresh();
+                        if let Some(idx) =
+                            self.visible().iter().position(|s| s.id == new_session.id)
+                        {
+                            self.list_state.select(Some(idx));
+                        }
+                        self.toast = Some(format!("new session {}", short_id(&new_session.id)));
+                        if and_open {
+                            ListCmd::OpenCodeReview(new_session)
+                        } else {
+                            ListCmd::Stay
+                        }
+                    }
+                    Err(e) => {
+                        self.name_error = Some(format!("{e}"));
+                        ListCmd::Stay
+                    }
+                }
+            }
+            KeyAction::FilterBackspace => {
+                self.name_buf.pop();
+                self.name_error = None;
+                ListCmd::Stay
+            }
+            KeyAction::FilterChar(c) => {
+                self.name_buf.push(c);
+                self.name_error = None;
+                ListCmd::Stay
+            }
+            _ => ListCmd::Stay,
+        }
+    }
 }
 
 pub fn render(f: &mut Frame, state: &mut SessionListState) {
@@ -312,6 +374,47 @@ pub fn render(f: &mut Frame, state: &mut SessionListState) {
     if state.help_open {
         render_help(f, area);
     }
+    if state.new_session_prompt {
+        render_name_prompt(f, area, state);
+    }
+}
+
+fn render_name_prompt(f: &mut Frame, area: Rect, state: &SessionListState) {
+    let popup_w = (area.width as i32 - 8).max(40) as u16;
+    let popup_h = 7u16.min(area.height.saturating_sub(4));
+    let x = (area.width.saturating_sub(popup_w)) / 2;
+    let y = (area.height.saturating_sub(popup_h)) / 2;
+    let popup = Rect::new(x, y, popup_w, popup_h);
+    f.render_widget(Clear, popup);
+
+    let mut lines: Vec<Line> = vec![
+        Line::from(Span::styled("new session name", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD))),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("> ", Style::default().fg(STATUS_FG)),
+            Span::styled(state.name_buf.clone(), Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
+            Span::styled("_", Style::default().fg(MUTED)),
+        ]),
+        Line::from(""),
+    ];
+    if let Some(err) = &state.name_error {
+        lines.push(Line::from(Span::styled(
+            err.clone(),
+            Style::default().fg(Color::Red),
+        )));
+    } else {
+        lines.push(Line::from(Span::styled(
+            "enter to create, esc to cancel",
+            Style::default().fg(MUTED),
+        )));
+    }
+    let p = Paragraph::new(lines).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(ACCENT))
+            .title(" new session "),
+    );
+    f.render_widget(p, popup);
 }
 
 fn status_line(state: &SessionListState) -> Paragraph<'static> {
@@ -414,16 +517,23 @@ h/l prev/next snap, tab next file, q / Esc back to the list.
     f.render_widget(paragraph, popup);
 }
 
-fn row_for_session(s: &Session) -> ListItem<'static> {
+fn row_for_session(s: &SessionMeta) -> ListItem<'static> {
     let id_short: String = s.id.as_str().chars().take(10).collect();
     let status = if s.is_open() { "open  " } else { "closed" };
     let started = format_started(s.started_at);
-    let summary = format!(
-        "{id_short}  {status}  {} files  {} snaps  started {started}",
-        s.file_count, s.snap_count
-    );
-    let line = Line::from(Span::raw(summary));
-    ListItem::new(vec![line])
+    // Two-line row: name (bold, prominent) on top, id + status + snap
+    // count + started on the bottom. The name was missing before; the
+    // id-only row made it impossible to tell sessions apart at a
+    // glance.
+    let name_line = Line::from(Span::styled(
+        s.name.clone(),
+        Style::default().add_modifier(Modifier::BOLD),
+    ));
+    let meta_line = Line::from(Span::styled(
+        format!("{id_short}  {status}  {:>3} snaps  {started}", s.snap_count),
+        Style::default().fg(MUTED),
+    ));
+    ListItem::new(vec![name_line, meta_line])
 }
 
 fn short_id(id: &SessionId) -> String {

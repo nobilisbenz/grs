@@ -9,12 +9,10 @@
 //!   .grs/
 //!     sessions/
 //!       <slug>_<ulid>/          # one session folder
-//!         meta.toml              # SessionMeta
-//!         snap-1/                # one snap (whole project tree)
-//!           meta.toml            # SnapMeta
-//!           <repo-relative file copies...>
-//!         snap-2/
-//!           ...
+//!         meta.toml              # SessionMeta (TOML)
+//!         snap-0001.json         # SnapJson (one file per snap; whole project tree)
+//!         snap-0002.json
+//!         ...
 //!     .lock                      # prevents concurrent TUI on same project
 //!   .grsignore                   # ignore patterns
 //!   config.toml                  # in .grs/, optional
@@ -92,14 +90,9 @@ impl GrsPaths {
         self.session_dir(id).join(META_FILE)
     }
 
-    /// `.grs/sessions/<slug>_<ulid>/snap-N/`.
-    pub fn snap_dir(&self, id: &SessionId, n: u32) -> PathBuf {
-        self.session_dir(id).join(format!("snap-{n}"))
-    }
-
-    /// `.grs/sessions/<slug>_<ulid>/snap-N/meta.toml`.
-    pub fn snap_meta(&self, id: &SessionId, n: u32) -> PathBuf {
-        self.snap_dir(id, n).join(META_FILE)
+    /// `.grs/sessions/<slug>_<ulid>/snap-NNNN.json`.
+    pub fn snap_file(&self, id: &SessionId, n: u32) -> PathBuf {
+        self.session_dir(id).join(format!("snap-{n:04}.json"))
     }
 }
 

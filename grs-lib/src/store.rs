@@ -83,12 +83,31 @@ impl RepoStore {
     pub fn open_first_session(&self, name: String) -> Result<SessionMeta> {
         let session = self.sessions().create_new(name, now_ms())?;
         self.set_head(&session.id)?;
-        // Capture snap 1 = state of project at session start.
+        // Capture snap 1 = state of project at session start. A save
+        // that touches N files produces N snaps; the count is the
+        // number written.
         let ignore = self.ignore_matcher()?;
-        self.snaps().capture(&session.id, &ignore)?;
+        let initial_snaps = self.snaps().capture(&session.id, &ignore)?;
         // Re-read so the in-memory copy reflects the updated snap_count.
         let mut session = self.sessions().get(&session.id)?;
-        session.snap_count = 1;
+        session.snap_count = initial_snaps.len() as u32;
+        if session.snap_count == 0 {
+            // Empty project: still allocate snap-1 with no files, so
+            // the session has at least one record and downstream
+            // dedupe / view logic can rely on the existence of a snap.
+            let ts = crate::util::time::now_ms();
+            let snap = crate::model::SnapJson {
+                version: crate::model::STORAGE_VERSION,
+                n: 1,
+                timestamp: ts,
+                file_path: String::new(),
+                tree_sha: String::new(),
+                files: Vec::new(),
+            };
+            let dest = self.paths().snap_file(&session.id, 1);
+            crate::snap::write_snap_json_pub(&dest, &snap)?;
+            session.snap_count = 1;
+        }
         self.sessions().write_meta(&session)?;
         Ok(session)
     }
@@ -242,11 +261,20 @@ mod tests {
         std::fs::write(dir.path().join("b.txt"), "world\n").unwrap();
         let (store, s) = open_session(dir.path());
         assert!(s.is_open());
-        assert_eq!(s.snap_count, 1);
-        // Snap 1 contains the two files.
-        let snap_meta = store.snaps().read_meta(&s.id, 1).unwrap();
-        assert_eq!(snap_meta.file_count, 2);
-        assert!(store.paths().snap_dir(&s.id, 1).join("a.txt").is_file());
+        // With one-file-per-snap, the first save (which has 2 files)
+        // produces 2 snaps. snap_count tracks the highest snap number.
+        assert_eq!(s.snap_count, 2);
+        // Snap 1 and snap 2 are separate JSON files, each with one file.
+        let snap1 = store.snaps().read(&s.id, 1).unwrap();
+        let snap2 = store.snaps().read(&s.id, 2).unwrap();
+        assert_eq!(snap1.files.len(), 1);
+        assert_eq!(snap2.files.len(), 1);
+        let paths: std::collections::HashSet<&str> =
+            [snap1.file_path.as_str(), snap2.file_path.as_str()].into_iter().collect();
+        assert!(paths.contains("a.txt"));
+        assert!(paths.contains("b.txt"));
+        assert!(store.paths().snap_file(&s.id, 1).is_file());
+        assert!(store.paths().snap_file(&s.id, 2).is_file());
     }
 
     #[test]
@@ -265,7 +293,8 @@ mod tests {
         // Add a new file and capture snap 2.
         std::fs::write(dir.path().join("a.txt"), "hello world\n").unwrap();
         let snap = store.snaps().capture(&original_id, &store.ignore_matcher().unwrap()).unwrap();
-        store.sessions().update_snap_count(&original_id, snap.n).unwrap();
+        let last_n = snap.last().map(|s| s.n).unwrap_or(0);
+        store.sessions().update_snap_count(&original_id, last_n).unwrap();
 
         // Rotate: finalize old, start new.
         let new = store.rotate_open_session("second".into(), 5000).unwrap();

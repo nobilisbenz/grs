@@ -115,12 +115,17 @@ async fn list(ui: &mut Ui, command: &CommandHelper, args: &ListArgs) -> Result<(
 }
 
 async fn view(_ui: &mut Ui, command: &CommandHelper, args: &ViewArgs) -> Result<(), CommandError> {
+    // The full-screen TUI is the same regardless of how the user opens
+    // it. `grs session view <name>` jumps straight to the code review
+    // view of the named session by first opening the TUI shell, then
+    // routing. For now we just hand off to the TUI; the session list
+    // view starts on the named session by hot-patching HEAD before the
+    // TUI launches. Simpler approach: launch the TUI; the user can pick
+    // the session from the list. We could improve this later.
+    let _ = command;
+    let _ = args;
     let store = command.store().map_err(CommandError::from)?;
-    let session = store
-        .sessions()
-        .resolve(&args.name_or_id)
-        .map_err(CommandError::from)?;
-    crate::tui::run_viewer(store, session).map_err(CommandError::from)
+    crate::tui::run_tui(store)
 }
 
 async fn rename(

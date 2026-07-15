@@ -189,13 +189,15 @@ fn capture_if_changed(
     snap_store: &SnapStore,
     ignore: &IgnoreMatcher,
 ) -> Result<()> {
-    if let Some(meta) = snap_store.capture_if_changed(open_session, ignore)? {
-        store
-            .sessions()
-            .update_snap_count(open_session, meta.n)?;
-        debug!(n = meta.n, files = meta.file_count, "snap captured");
+    if let Some(snaps) = snap_store.capture_if_changed(open_session, ignore)? {
+        if let Some(last) = snaps.last() {
+            store
+                .sessions()
+                .update_snap_count(open_session, last.n)?;
+            debug!(count = snaps.len(), last_n = last.n, "snaps captured");
+        }
     } else {
-        debug!("tree unchanged — no new snap");
+        debug!("tree unchanged — no new snaps");
     }
     Ok(())
 }
@@ -230,11 +232,15 @@ mod tests {
         let ignore = store.ignore_matcher().unwrap();
         let snap_store = store.snaps();
         std::fs::write(dir.path().join("a.txt"), "hello\n").unwrap();
-        let meta = snap_store.capture_if_changed(&head, &ignore).unwrap();
-        assert!(meta.is_some(), "expected a snap, got None (tree unchanged?)");
-        let meta = meta.unwrap();
-        assert!(meta.n >= 2, "expected snap >= 2, got {}", meta.n);
-        assert!(store.paths().snap_dir(&head, meta.n).join("a.txt").is_file());
+        let snaps = snap_store.capture_if_changed(&head, &ignore).unwrap();
+        assert!(snaps.is_some(), "expected snaps, got None (tree unchanged?)");
+        let snaps = snaps.unwrap();
+        assert!(!snaps.is_empty());
+        let last_n = snaps.last().unwrap().n;
+        assert!(last_n >= 2, "expected snap >= 2, got {last_n}");
+        // The new snap is a JSON file and its file_path is a.txt.
+        let snap = snap_store.read(&head, last_n).unwrap();
+        assert_eq!(snap.file_path, "a.txt");
     }
 
     #[test]
@@ -280,9 +286,9 @@ mod tests {
             after > initial,
             "watcher should have captured at least one new snap (initial={initial}, after={after})"
         );
-        // Snap N (or higher) should contain new.txt.
-        let snap = store.snaps().read_meta(&session_id, after).unwrap();
-        let has_new = snap.files.iter().any(|f| f.path == "new.txt");
+        // The latest snap should contain new.txt.
+        let snap = store.snaps().read(&session_id, after).unwrap();
+        let has_new = snap.file_path == "new.txt";
         assert!(has_new, "new.txt should be in the latest snap");
         stop_tx.send(()).ok();
         let _ = handle.join();
@@ -323,8 +329,8 @@ mod tests {
             after > initial,
             "watcher should have captured at least one new snap (initial={initial}, after={after})"
         );
-        let snap = store.snaps().read_meta(&session_id, after).unwrap();
-        let has = snap.files.iter().any(|f| f.path == "wrote.txt");
+        let snap = store.snaps().read(&session_id, after).unwrap();
+        let has = snap.file_path == "wrote.txt";
         assert!(has, "wrote.txt should be in the latest snap");
         stop_tx.send(()).ok();
         let _ = handle.join();

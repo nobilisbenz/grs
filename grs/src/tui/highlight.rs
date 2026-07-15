@@ -15,7 +15,7 @@
 //! matching git-diff conventions.
 
 use crate::tui::theme::{ADDED_BG, MUTED, REMOVED_BG};
-use ratatui::style::{Color, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use similar::{ChangeTag, TextDiff};
 use std::collections::HashMap;
@@ -143,34 +143,37 @@ pub fn render_snap(
         // The actual text of the change, stripped of the trailing newline
         // (TextDiff includes the newline as part of the value).
         let text = change.value().trim_end_matches('\n');
-        let (sign, line_no, bg) = match tag {
-            ChangeTag::Equal => (" ", change.new_index().map(|i| i + 1), None),
-            ChangeTag::Insert => ("+", change.new_index().map(|i| i + 1), Some(ADDED_BG)),
-            ChangeTag::Delete => ("-", change.old_index().map(|i| i + 1), Some(REMOVED_BG)),
+        let (sign, line_no, bg, marker_fg) = match tag {
+            ChangeTag::Equal => (" ", change.new_index().map(|i| i + 1), None, None),
+            ChangeTag::Insert => (
+                "+",
+                change.new_index().map(|i| i + 1),
+                Some(ADDED_BG),
+                Some(Color::LightGreen),
+            ),
+            ChangeTag::Delete => (
+                "-",
+                change.old_index().map(|i| i + 1),
+                Some(REMOVED_BG),
+                Some(Color::LightRed),
+            ),
         };
         // Highlight with syntax; the bg tint is applied at the line level
         // so it covers the full row.
-        let mut spans: Vec<Span<'static>> = match bg {
-            Some(_) => {
-                let mut s = Vec::new();
-                if with_line_numbers {
-                    let n = line_no.unwrap_or(0);
-                    let gutter = format!("{sign} {n:>gutter_width$} │ ");
-                    s.push(Span::styled(gutter, Style::default().fg(MUTED)));
-                }
-                s.extend(engine.highlight_line(text, syntax.as_ref()));
-                s
+        let spans: Vec<Span<'static>> = {
+            let mut s = Vec::new();
+            if with_line_numbers {
+                let n = line_no.unwrap_or(0);
+                let gutter = format!("{sign} {n:>gutter_width$} │ ");
+                let style = match (bg, marker_fg) {
+                    (Some(_), Some(mfg)) => Style::default().fg(mfg).add_modifier(Modifier::BOLD),
+                    (Some(_), None) => Style::default().fg(MUTED),
+                    (None, _) => gutter_style,
+                };
+                s.push(Span::styled(gutter, style));
             }
-            None => {
-                let mut s = Vec::new();
-                if with_line_numbers {
-                    let n = line_no.unwrap_or(0);
-                    let gutter = format!("{sign} {n:>gutter_width$} │ ");
-                    s.push(Span::styled(gutter, gutter_style));
-                }
-                s.extend(engine.highlight_line(text, syntax.as_ref()));
-                s
-            }
+            s.extend(engine.highlight_line(text, syntax.as_ref()));
+            s
         };
         let line = if let Some(bg) = bg {
             Line::from(spans).style(Style::default().bg(bg))
@@ -195,7 +198,7 @@ fn gutter_width_known_to_match(_width: usize, _lines: &[Line<'_>]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use grs_lib::model::LineDiff;
+    use ratatui::style::Color;
 
     #[test]
     fn render_snap_marks_added_lines_with_green_bg() {
@@ -298,20 +301,14 @@ mod tests {
         }
     }
 
-    // Verify that the existing `LineDiff` arrays are no longer consulted at
-    // render time (they're metadata on disk; render_snap only uses
-    // prev_content + content).
+    // Verify that any pre-computed `added_lines`/`removed_lines`
+    // metadata is *not* consulted at render time — render_snap only
+    // uses prev_content + content via `similar`.
     #[test]
-    fn render_snap_ignores_line_diff_arrays() {
+    fn render_snap_derives_diff_from_content() {
         let mut engine = HighlightEngine::new("base16-eighties.dark");
         let prev = "x\ny\n";
         let content = "x\ny\nz\n";
-        // LineDiff.added_lines = [99] (wrong on purpose).
-        let _diff = LineDiff {
-            added_lines: vec![99],
-            removed_lines: vec![99],
-            prev_seq: None,
-        };
         let lines = render_snap(&mut engine, prev, content, "a.txt", true);
         // 3 rows: 2 equal, 1 insert at the actual position (line 3).
         assert_eq!(lines.len(), 3);

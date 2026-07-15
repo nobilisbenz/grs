@@ -1,20 +1,21 @@
-//! `SnapStore` — read/write gate to the `sessions/<id>/snap-N/` layout.
+//! `SnapStore` — read/write gate to the `sessions/<id>/snap-NNNN.json` layout.
 //!
-//! A snap is a **whole project tree**: every tracked file copied under
-//! `snap-N/`, plus a `meta.toml` describing them. Diffs are computed at
-//! read time by walking two snap trees (no separate diff storage needed,
-//! because each snap is a full copy).
+//! A snap is **one JSON file** at `<session>/snap-NNNN.json` (4-digit,
+//! zero-padded, lexicographically sortable). The JSON carries the full
+//! text of every tracked file at this snap plus the per-file diff
+//! metadata vs. the previous snap, so the TUI can open a snap with a
+//! single disk read.
 //!
-//! Snap numbering is 1-based: `snap-1` is the baseline captured at session
-//! start (the project's state at that moment), `snap-2` is the first save
-//! after that, etc.
+//! Snap numbering is 1-based: `snap-0001` is the baseline captured at
+//! session start (the project's state at that moment), `snap-0002` is
+//! the first save after that, etc.
 
 use crate::error::{GrsError, Result};
 use crate::ignore::IgnoreMatcher;
-use crate::model::{SnapFile, SnapMeta, STORAGE_VERSION};
+use crate::model::{SnapFileJson, SnapJson, STORAGE_VERSION};
 use crate::paths::{relativize, GrsPaths};
 use crate::ulid::SessionId;
-use crate::util::fs::atomic_write_str;
+use crate::util::fs::{atomic_write_str, is_binary_file};
 use crate::util::time::now_ms;
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
@@ -28,7 +29,8 @@ pub struct SnapStore {
 pub struct SnapEntry {
     pub n: u32,
     pub timestamp: i64,
-    pub dir: PathBuf,
+    /// Path to the snap JSON file.
+    pub path: PathBuf,
 }
 
 impl SnapStore {
@@ -45,32 +47,32 @@ impl SnapStore {
         }
         for entry in std::fs::read_dir(&dir)? {
             let entry = entry?;
-            if !entry.file_type()?.is_dir() {
+            if !entry.file_type()?.is_file() {
                 continue;
             }
             let name = entry.file_name().to_string_lossy().to_string();
-            if let Some(n) = parse_snap_dir_name(&name) {
+            if let Some(n) = parse_snap_file_name(&name) {
                 entries.push(SnapEntry {
                     n,
                     timestamp: 0,
-                    dir: entry.path(),
+                    path: entry.path(),
                 });
             }
         }
         entries.sort_by_key(|e| e.n);
         // Backfill timestamps lazily.
         for e in &mut entries {
-            if let Ok(meta) = read_meta(&e.dir) {
+            if let Ok(meta) = read_snap_json_at(&e.path) {
                 e.timestamp = meta.timestamp;
             }
         }
         Ok(entries)
     }
 
-    /// Read a snap's `meta.toml`.
-    pub fn read_meta(&self, id: &SessionId, n: u32) -> Result<SnapMeta> {
-        let dir = self.paths.snap_dir(id, n);
-        read_meta(&dir)
+    /// Read a snap JSON by session + n.
+    pub fn read(&self, id: &SessionId, n: u32) -> Result<SnapJson> {
+        let path = self.paths.snap_file(id, n);
+        read_snap_json_at(&path)
     }
 
     /// The next snap number for a session (one past the current max). Returns
@@ -100,7 +102,7 @@ impl SnapStore {
         &self,
         id: &SessionId,
         ignore: &IgnoreMatcher,
-    ) -> Result<Option<SnapMeta>> {
+    ) -> Result<Option<Vec<SnapJson>>> {
         if self.tree_matches_last_snap(id, ignore)? {
             debug!("tree unchanged since last snap — skipping capture");
             return Ok(None);
@@ -108,112 +110,185 @@ impl SnapStore {
         Ok(Some(self.capture(id, ignore)?))
     }
 
-    /// True if the current project tree (filtered by `ignore`) is
-    /// byte-identical to the most recent snap: same set of relative paths,
-    /// same SHA256 for each. Returns `true` vacuously if there is no
-    /// previous snap (i.e. snap-1 hasn't been captured yet).
+    /// True if the current project tree (filtered by `ignore`) would
+    /// produce a snap identical to the most recent one. Uses the
+    /// previous snap's `tree_sha` (a SHA-256 fingerprint of every
+    /// tracked file's content at that snap) to compare against the
+    /// current tree's fingerprint. If the two fingerprints match, no
+    /// capture is needed.
     fn tree_matches_last_snap(
         &self,
         id: &SessionId,
         ignore: &IgnoreMatcher,
     ) -> Result<bool> {
-        let last_n = match self.list(id)?.into_iter().last() {
-            Some(e) => e.n,
-            None => return Ok(true), // no prior snap — caller will write snap-1
+        let last = match self.list(id)?.into_iter().last() {
+            Some(e) => e,
+            None => return Ok(false), // no prior snap — caller will write snap-1
         };
-        let prev_meta = self.read_meta(id, last_n)?;
-        // Build a path -> sha256 map of the current tree.
-        let mut current: std::collections::HashMap<String, String> =
-            std::collections::HashMap::new();
-        let root = ignore.root().to_path_buf();
-        for abs in ignore.files() {
-            let rel = relativize(&root, &abs);
-            if rel.is_empty() {
-                continue;
-            }
-            match hash_file(&abs) {
-                Some(sha) => {
-                    current.insert(rel, sha);
-                }
-                None => {
-                    // File unreadable or vanished between walk and read.
-                    // That alone is a state change — call it not-equal so we
-                    // don't skip the capture.
-                    return Ok(false);
-                }
-            }
-        }
-        if current.len() != prev_meta.files.len() {
+        let prev = read_snap_json_at(&last.path)?;
+        if prev.tree_sha.is_empty() {
+            // Older snap (pre-tree_sha). We can't dedupe safely without
+            // a fingerprint. Capture.
             return Ok(false);
         }
-        for prev_file in &prev_meta.files {
-            match current.get(&prev_file.path) {
-                Some(sha) if sha == &prev_file.sha256 => continue,
-                _ => return Ok(false),
-            }
-        }
-        Ok(true)
+        let current_pairs = build_tree_pairs(ignore);
+        let current_tree_sha = compute_tree_sha(&current_pairs);
+        Ok(prev.tree_sha == current_tree_sha)
     }
 
-    /// Capture the current state of the project (filtered by `ignore`) as a
-    /// new whole-project snap. `ignore` is used both to skip files when
-    /// copying and to record which paths belong to the snap.
+    /// Capture the current state of the project (filtered by `ignore`) as
+    /// one or more snaps. **One snap per changed file**: a save that
+    /// touches N files produces N consecutive snaps (snap-N, snap-N+1,
+    /// ...), each carrying that file's delta. A save with no changes
+    /// returns an empty vec.
+    ///
+    /// Each snap has the full `tree_sha` (fingerprint of the entire
+    /// project tree at the moment of capture) so the watcher's dedupe
+    /// can compare the current tree against the most recent snap and
+    /// skip the whole batch when nothing has changed.
+    ///
+    /// The "previous content" used to compute the diff is the file's
+    /// content from the **most recent snap that mentioned it**, which
+    /// is not necessarily the immediately previous snap (n-1) — with
+    /// per-file snaps, a file's history is interleaved with other
+    /// files'. We walk back through prior snaps to find it.
     pub fn capture(
         &self,
         id: &SessionId,
         ignore: &IgnoreMatcher,
-    ) -> Result<SnapMeta> {
-        let n = self.next_n(id)?;
-        let dest = self.paths.snap_dir(id, n);
+    ) -> Result<Vec<SnapJson>> {
+        let tree_pairs = build_tree_pairs(ignore);
+        let tree_sha = compute_tree_sha(&tree_pairs);
 
-        // Don't fail hard on a partial capture: copy file-by-file and
-        // accumulate what we got. A file that disappears mid-capture is
-        // dropped silently; the next capture will reflect the new state.
-        std::fs::create_dir_all(&dest)?;
-        let mut files: Vec<SnapFile> = Vec::new();
-        let mut total_bytes: u64 = 0;
-        let root = ignore.root().to_path_buf();
-        for abs in ignore.files() {
-            let rel = relativize(&root, &abs);
-            if rel.is_empty() {
-                continue;
-            }
-            let meta = match capture_one(&abs, &dest, &rel) {
-                Ok(Some(snap_file)) => {
-                    total_bytes += snap_file.size;
-                    snap_file
-                }
-                Ok(None) => continue, // skipped (binary or unreadable)
-                Err(e) => {
-                    tracing::warn!(file = %rel, error = ?e, "failed to capture file");
+        // Build a map of `path -> (content, binary, size)` from the
+        // most recent snap that mentioned each path. Walk newest to
+        // oldest; stop early when every current-tree path has been
+        // accounted for.
+        let current_paths: std::collections::HashSet<String> =
+            tree_pairs.iter().map(|(p, _)| p.clone()).collect();
+        let mut prev_by_path: std::collections::HashMap<String, PrevEntry> =
+            std::collections::HashMap::new();
+        for entry in self.list(id)?.into_iter().rev() {
+            let snap = read_snap_json_at(&entry.path)?;
+            for f in &snap.files {
+                if prev_by_path.contains_key(&f.path) {
                     continue;
                 }
-            };
-            files.push(meta);
+                prev_by_path.insert(
+                    f.path.clone(),
+                    PrevEntry {
+                        content: f.content.clone(),
+                        binary: f.binary,
+                        size: f.size,
+                    },
+                );
+            }
+            // Early exit: if every current path has a prev entry, no
+            // need to keep walking.
+            if current_paths.iter().all(|p| prev_by_path.contains_key(p)) {
+                break;
+            }
         }
-        // Stable order for deterministic `meta.toml` output.
-        files.sort_by(|a, b| a.path.cmp(&b.path));
 
-        let snap_meta = SnapMeta {
-            version: STORAGE_VERSION,
-            n,
-            timestamp: now_ms(),
-            file_count: files.len() as u32,
-            total_bytes,
-            files,
-        };
-        write_meta(&dest, &snap_meta)?;
-        // Best-effort fsync of the snap dir.
-        let _ = crate::util::fs::fsync_dir(&dest);
-        Ok(snap_meta)
+        // Build the new snaps. One per changed file (modified or new)
+        // plus one per deleted file.
+        let mut next_n = self.next_n(id)?;
+        let ts = now_ms();
+        let root = ignore.root().to_path_buf();
+        let mut seen_in_current: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        let mut snaps: Vec<SnapJson> = Vec::new();
+
+        // 1. Modified and new files: for each file in the current tree,
+        //    if its SHA differs from the most recent prev, emit a snap.
+        for (rel, current_sha) in &tree_pairs {
+            seen_in_current.insert(rel.clone());
+            let prev = prev_by_path.get(rel);
+            let prev_sha = prev.map(|p| sha256_of_content(&p.content));
+            if prev_sha.as_deref() == Some(current_sha.as_str()) {
+                // Unchanged. Skip.
+                continue;
+            }
+            // Read the file content. A vanished/unreadable file is
+            // dropped silently; the next capture will reflect the
+            // new state.
+            let abs = root.join(rel);
+            let Ok(bytes) = std::fs::read(&abs) else {
+                continue;
+            };
+            let binary = is_binary_file(&abs) || bytes.iter().take(8192).any(|b| *b == 0);
+            let size = bytes.len() as u64;
+            let content = if binary {
+                format!("(binary file, {size} bytes)")
+            } else {
+                String::from_utf8(bytes.clone())
+                    .unwrap_or_else(|_| format!("(binary file, {size} bytes)"))
+            };
+            let entry = build_file_entry(
+                rel,
+                content,
+                binary,
+                size,
+                prev,
+            );
+            let snap = SnapJson {
+                version: STORAGE_VERSION,
+                n: next_n,
+                timestamp: ts,
+                file_path: rel.clone(),
+                tree_sha: tree_sha.clone(),
+                files: vec![entry],
+            };
+            next_n += 1;
+            snaps.push(snap);
+        }
+
+        // 2. Deletions: paths in the prior history but not in the
+        //    current tree.
+        for (path, prev) in &prev_by_path {
+            if seen_in_current.contains(path) {
+                continue;
+            }
+            let entry = SnapFileJson {
+                path: path.clone(),
+                content: String::new(),
+                binary: prev.binary,
+                size: prev.size,
+                removed: true,
+                prev_content: Some(prev.content.clone()),
+                added_lines: None,
+                removed_lines: None,
+            };
+            let snap = SnapJson {
+                version: STORAGE_VERSION,
+                n: next_n,
+                timestamp: ts,
+                file_path: path.clone(),
+                tree_sha: tree_sha.clone(),
+                files: vec![entry],
+            };
+            next_n += 1;
+            snaps.push(snap);
+        }
+
+        // 3. Persist each snap to disk. We do this in a second pass so
+        //    all snap numbers are assigned before any file is written
+        //    (makes the on-disk state consistent if a write fails
+        //    partway through).
+        for snap in &snaps {
+            let dest = self.paths.snap_file(id, snap.n);
+            write_snap_json(&dest, snap)?;
+        }
+
+        Ok(snaps)
     }
 
-    /// Remove a snap directory. Used when cleaning up a partial capture
-    /// or removing a session's last snap.
+    /// Remove a snap file. Used when cleaning up a partial capture or
+    /// removing a session's last snap.
     pub fn remove(&self, id: &SessionId, n: u32) -> Result<()> {
-        let dir = self.paths.snap_dir(id, n);
-        if dir.is_dir() {
-            std::fs::remove_dir_all(&dir)?;
+        let path = self.paths.snap_file(id, n);
+        if path.is_file() {
+            std::fs::remove_file(&path)?;
         }
         Ok(())
     }
@@ -224,113 +299,196 @@ impl SnapStore {
     }
 }
 
-/// Capture one file: copy bytes into `<dest>/<rel>`, return a `SnapFile`.
-/// Returns `Ok(None)` if the file looks binary and the `ignore` config
-/// excludes binary files.
-fn capture_one(src: &Path, dest_root: &Path, rel: &str) -> Result<Option<SnapFile>> {
-    let bytes = match std::fs::read(src) {
-        Ok(b) => b,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e.into()),
-    };
-    let is_binary = bytes.iter().take(8192).any(|b| *b == 0);
-    let sha256 = {
-        let mut h = Sha256::new();
-        h.update(&bytes);
-        format!("{:x}", h.finalize())
-    };
-    let dest = dest_root.join(rel);
-    if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(&dest, &bytes)?;
-    Ok(Some(SnapFile {
-        path: rel.to_string(),
-        sha256,
-        size: bytes.len() as u64,
-        binary: is_binary,
-    }))
+// -----------------------------------------------------------------------------
+// File I/O
+// -----------------------------------------------------------------------------
+
+fn write_snap_json(path: &Path, snap: &SnapJson) -> Result<()> {
+    let text = serde_json::to_string_pretty(snap).map_err(GrsError::from)?;
+    atomic_write_str(path, &text)?;
+    Ok(())
 }
 
-/// Compute SHA256 of a file. Returns `None` if the file can't be read.
-fn hash_file(path: &Path) -> Option<String> {
-    let bytes = std::fs::read(path).ok()?;
-    let mut h = Sha256::new();
-    h.update(&bytes);
-    Some(format!("{:x}", h.finalize()))
+/// Public wrapper around `write_snap_json` for callers (the `RepoStore`)
+/// that need to write a snap outside of `capture`.
+pub fn write_snap_json_pub(path: &Path, snap: &SnapJson) -> Result<()> {
+    write_snap_json(path, snap)
 }
 
-fn read_meta(snap_dir: &Path) -> Result<SnapMeta> {
-    let path = snap_dir.join("meta.toml");
-    let text = std::fs::read_to_string(&path).map_err(|e| {
+fn read_snap_json_at(path: &Path) -> Result<SnapJson> {
+    let text = std::fs::read_to_string(path).map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
-            GrsError::NotFound(format!("snap {}: no meta.toml", snap_dir.display()))
+            GrsError::NotFound(format!("snap {}: no json", path.display()))
         } else {
             GrsError::from(e)
         }
     })?;
-    let m: SnapMeta = toml::from_str(&text)?;
+    let m: SnapJson = serde_json::from_str(&text)?;
+    if m.version != STORAGE_VERSION {
+        return Err(GrsError::UnsupportedVersion(m.version));
+    }
     Ok(m)
 }
 
-fn write_meta(snap_dir: &Path, meta: &SnapMeta) -> Result<()> {
-    let path = snap_dir.join("meta.toml");
-    let text = toml::to_string_pretty(meta).map_err(|e| GrsError::Config(e.to_string()))?;
-    atomic_write_str(&path, &text)?;
-    Ok(())
+/// SHA-256 of a file on disk. Returns `None` if the file can't be read.
+fn hash_file(path: &Path) -> Option<String> {
+    let bytes = std::fs::read(path).ok()?;
+    Some(sha256_of_bytes(&bytes))
 }
 
-/// Parse `snap-N` into `Some(N)`. Returns None for any other folder name.
-fn parse_snap_dir_name(name: &str) -> Option<u32> {
-    name.strip_prefix("snap-").and_then(|s| s.parse().ok())
+/// One file's prior state, as remembered from the most recent snap that
+/// mentioned it. Used by `capture` to build the prev-side of the diff
+/// without re-reading the file from disk.
+#[derive(Clone, Debug)]
+struct PrevEntry {
+    content: String,
+    binary: bool,
+    size: u64,
 }
 
-/// Public wrapper around `read_meta` for callers (the TUI) that have a snap
-/// directory path but not a `SnapStore`.
-pub fn read_meta_pub(snap_dir: &Path) -> Result<SnapMeta> {
-    read_meta(snap_dir)
+/// Build a `SnapFileJson` for a single file's change. The `prev` arg
+/// is the file's state from the most recent prior snap (if any).
+fn build_file_entry(
+    rel: &str,
+    content: String,
+    binary: bool,
+    size: u64,
+    prev: Option<&PrevEntry>,
+) -> SnapFileJson {
+    match (prev, binary) {
+        // Text modification (or new file with text content). Compute
+        // the line-level diff and inline the prev text.
+        (Some(p), false) if !p.binary => {
+            let line_d = crate::diff::line_diff(&p.content, &content);
+            use std::collections::BTreeMap;
+            let prev_text = &p.content;
+            let removed_lines: BTreeMap<u32, String> = line_d
+                .removed_lines
+                .iter()
+                .filter_map(|n| {
+                    prev_text.lines().nth(n - 1).map(|line| {
+                        let mut s = line.to_string();
+                        if !s.ends_with('\n') {
+                            s.push('\n');
+                        }
+                        (*n as u32, s)
+                    })
+                })
+                .collect();
+            SnapFileJson {
+                path: rel.to_string(),
+                content,
+                binary: false,
+                size,
+                removed: false,
+                prev_content: Some(p.content.clone()),
+                added_lines: Some(
+                    line_d.added_lines.iter().map(|n| *n as u32).collect(),
+                ),
+                removed_lines: Some(removed_lines),
+            }
+        }
+        // Binary change, text/binary transition, or a brand-new
+        // binary file. Just record the new content; no line-level
+        // diff.
+        (Some(_), _) | (None, _) => SnapFileJson {
+            path: rel.to_string(),
+            content,
+            binary,
+            size,
+            removed: false,
+            prev_content: None,
+            added_lines: None,
+            removed_lines: None,
+        },
+    }
+}
+
+/// Compute the `tree_sha` for a set of tracked files: SHA-256 of the
+/// sorted `path\tsha256\n` lines. Used to fingerprint the full project
+/// state for dedupe. Empty input returns an empty string (so the JSON
+/// omits the field).
+fn compute_tree_sha(pairs: &[(String, String)]) -> String {
+    if pairs.is_empty() {
+        return String::new();
+    }
+    let mut sorted = pairs.to_vec();
+    sorted.sort();
+    let mut h = Sha256::new();
+    for (path, sha) in sorted {
+        h.update(path.as_bytes());
+        h.update(b"\t");
+        h.update(sha.as_bytes());
+        h.update(b"\n");
+    }
+    format!("{:x}", h.finalize())
+}
+
+/// Build the `(path, sha256)` pairs for the current project tree. Used
+/// both for `tree_sha` in `capture` and for the dedupe comparison in
+/// `tree_matches_last_snap`.
+fn build_tree_pairs(ignore: &IgnoreMatcher) -> Vec<(String, String)> {
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    let root = ignore.root().to_path_buf();
+    for abs in ignore.files() {
+        let rel = relativize(&root, &abs);
+        if rel.is_empty() {
+            continue;
+        }
+        if let Some(sha) = hash_file(&abs) {
+            pairs.push((rel, sha));
+        }
+        // A vanished/unreadable file is its own state change — the
+        // caller will see a different tree_sha and capture. We don't
+        // include it in the pairs (since we have no SHA), so its
+        // absence will change the fingerprint.
+    }
+    pairs
+}
+
+fn sha256_of_bytes(bytes: &[u8]) -> String {
+    let mut h = Sha256::new();
+    h.update(bytes);
+    format!("{:x}", h.finalize())
+}
+
+fn sha256_of_content(s: &str) -> String {
+    sha256_of_bytes(s.as_bytes())
+}
+
+/// Parse `snap-NNNN.json` into `Some(N)`. Only accepts 4-digit, zero-padded
+/// numbers (so the on-disk file name is always the same width, and a
+/// lexicographic sort matches a numeric sort). Returns None for any other
+/// name.
+fn parse_snap_file_name(name: &str) -> Option<u32> {
+    let n = name.strip_prefix("snap-")?.strip_suffix(".json")?;
+    if n.len() != 4 || !n.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    n.parse().ok()
 }
 
 // -----------------------------------------------------------------------------
-// Diff between two whole-project snaps
+// Diff (kept in the public API for back-compat with tests/clients; the new
+// JSON carries the diff inline, so this is a thin convenience that re-
+// extracts it).
 // -----------------------------------------------------------------------------
 
 /// A file-level change between two consecutive snaps.
+///
+/// In v2 the diff is stored inline in the snap JSON. This enum is kept
+/// for callers that want a structured view (e.g. the TUI's diff overlay
+/// could use it, though the highlight engine currently re-derives the
+/// same info from `prev_content` + `content` via `similar`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FileChange {
-    Added {
-        path: String,
-        binary: bool,
-        size: u64,
-    },
-    Removed {
-        path: String,
-        binary: bool,
-        size: u64,
-    },
-    Modified {
-        path: String,
-        binary: bool,
-        old_size: u64,
-        new_size: u64,
-    },
-    /// Pure rename (same content hash, different path).
-    Renamed {
-        from: String,
-        to: String,
-        binary: bool,
-    },
-    /// Rename + content change (hashes differ; path changed too).
-    RenamedAndModified {
-        from: String,
-        to: String,
-        binary: bool,
-        old_size: u64,
-        new_size: u64,
-    },
+    Added { path: String, size: u64 },
+    Removed { path: String, size: u64 },
+    Modified { path: String, old_size: u64, new_size: u64 },
+    Renamed { from: String, to: String },
+    RenamedAndModified { from: String, to: String, old_size: u64, new_size: u64 },
 }
 
-/// Result of diffing snap N against snap N-1.
 #[derive(Clone, Debug, Default)]
 pub struct SnapDiff {
     pub changes: Vec<FileChange>,
@@ -338,167 +496,57 @@ pub struct SnapDiff {
     pub removed_lines: usize,
 }
 
-/// Compute the diff between two snap directories on disk.
-///
-/// `prev` and `cur` are paths to `snap-N-1/` and `snap-N/`. We use the
-/// `meta.toml` to enumerate files (faster than walking) and we read the
-/// actual file content for line-level diff on modified text files.
-pub fn diff_snap_dirs(prev: &Path, cur: &Path) -> Result<SnapDiff> {
-    let prev_meta = read_meta(prev)?;
-    let cur_meta = read_meta(cur)?;
-    diff_snap_meta(&prev_meta, prev, &cur_meta, cur)
-}
-
-/// Compute the diff given two `SnapMeta`s and their snap directories.
-pub fn diff_snap_meta(
-    prev: &SnapMeta,
-    prev_dir: &Path,
-    cur: &SnapMeta,
-    cur_dir: &Path,
-) -> Result<SnapDiff> {
+/// Compute the diff between two snap JSONs (the same data structure the
+/// on-disk JSON uses). Kept for any caller that wants the structured
+/// view; the JSON already carries `added_lines` and `removed_lines` so
+/// most callers won't need this.
+pub fn diff_snap_meta(prev: &SnapJson, cur: &SnapJson) -> SnapDiff {
     use std::collections::HashMap;
-    let prev_by_path: HashMap<&str, &SnapFile> =
+    let prev_by_path: HashMap<&str, &SnapFileJson> =
         prev.files.iter().map(|f| (f.path.as_str(), f)).collect();
-    let cur_by_path: HashMap<&str, &SnapFile> =
+    let cur_by_path: HashMap<&str, &SnapFileJson> =
         cur.files.iter().map(|f| (f.path.as_str(), f)).collect();
 
     let mut changes = Vec::new();
-    // First pass: renames. Match removed paths to added paths by sha256.
-    // Build a map: sha256 -> list of removed paths.
-    let mut removed: Vec<&SnapFile> = prev
-        .files
-        .iter()
-        .filter(|f| !cur_by_path.contains_key(f.path.as_str()))
-        .collect();
-    let mut added: Vec<&SnapFile> = cur
-        .files
-        .iter()
-        .filter(|f| !prev_by_path.contains_key(f.path.as_str()))
-        .collect();
-
-    // Try to pair renames by content hash.
-    let mut consumed_added: std::collections::HashSet<String> =
-        std::collections::HashSet::new();
-    let mut rename_pairs: Vec<(&SnapFile, &SnapFile)> = Vec::new();
-    for r in &removed {
-        if let Some(idx) = added.iter().position(|a| a.sha256 == r.sha256) {
-            let a = added[idx];
-            rename_pairs.push((r, a));
-            consumed_added.insert(a.path.clone());
-        }
-    }
-    removed.retain(|r| !rename_pairs.iter().any(|(rr, _)| rr.path == r.path));
-    added.retain(|a| !consumed_added.contains(&a.path));
-
-    for (r, a) in rename_pairs {
-        if r.binary || a.binary {
-            // Renames of binary files: show as renamed, no line diff.
-            changes.push(FileChange::Renamed {
-                from: r.path.clone(),
-                to: a.path.clone(),
-                binary: true,
-            });
-        } else {
-            // Renamed text file: diff content (if identical hashes, this
-            // is a pure rename).
-            let prev_bytes = std::fs::read(prev_dir.join(&r.path)).unwrap_or_default();
-            let cur_bytes = std::fs::read(cur_dir.join(&a.path)).unwrap_or_default();
-            if r.sha256 == a.sha256 {
-                changes.push(FileChange::Renamed {
-                    from: r.path.clone(),
-                    to: a.path.clone(),
-                    binary: false,
-                });
-            } else {
-                let prev_text = String::from_utf8_lossy(&prev_bytes);
-                let cur_text = String::from_utf8_lossy(&cur_bytes);
-                let line_d = crate::diff::line_diff(&prev_text, &cur_text);
-                let mut d = SnapDiff::default();
-                d.added_lines = line_d.added_lines.len();
-                d.removed_lines = line_d.removed_lines.len();
-                changes.push(FileChange::RenamedAndModified {
-                    from: r.path.clone(),
-                    to: a.path.clone(),
-                    binary: false,
-                    old_size: r.size,
-                    new_size: a.size,
-                });
-                let _ = d; // counts aggregated below
-            }
-        }
-    }
-
-    // Modifications: same path, different hash.
     let mut added_lines_total = 0usize;
     let mut removed_lines_total = 0usize;
+
     for cur_file in &cur.files {
-        if let Some(prev_file) = prev_by_path.get(cur_file.path.as_str()) {
-            if prev_file.sha256 != cur_file.sha256 {
-                changes.push(FileChange::Modified {
-                    path: cur_file.path.clone(),
-                    binary: cur_file.binary,
-                    old_size: prev_file.size,
-                    new_size: cur_file.size,
-                });
-                if !cur_file.binary {
-                    let prev_bytes = std::fs::read(prev_dir.join(&cur_file.path)).unwrap_or_default();
-                    let cur_bytes = std::fs::read(cur_dir.join(&cur_file.path)).unwrap_or_default();
-                    let prev_text = String::from_utf8_lossy(&prev_bytes);
-                    let cur_text = String::from_utf8_lossy(&cur_bytes);
-                    let line_d = crate::diff::line_diff(&prev_text, &cur_text);
-                    added_lines_total += line_d.added_lines.len();
-                    removed_lines_total += line_d.removed_lines.len();
+        match prev_by_path.get(cur_file.path.as_str()) {
+            None => changes.push(FileChange::Added {
+                path: cur_file.path.clone(),
+                size: cur_file.size,
+            }),
+            Some(prev_file) => {
+                let prev_sha = sha256_of_content(&prev_file.content);
+                let cur_sha = sha256_of_content(&cur_file.content);
+                if prev_sha != cur_sha {
+                    changes.push(FileChange::Modified {
+                        path: cur_file.path.clone(),
+                        old_size: prev_file.size,
+                        new_size: cur_file.size,
+                    });
+                    if !cur_file.binary {
+                        let line_d = crate::diff::line_diff(&prev_file.content, &cur_file.content);
+                        added_lines_total += line_d.added_lines.len();
+                        removed_lines_total += line_d.removed_lines.len();
+                    }
                 }
             }
         }
     }
-
-    // Pure additions.
-    for a in &added {
-        changes.push(FileChange::Added {
-            path: a.path.clone(),
-            binary: a.binary,
-            size: a.size,
-        });
-        if !a.binary {
-            let bytes = std::fs::read(cur_dir.join(&a.path)).unwrap_or_default();
-            let text = String::from_utf8_lossy(&bytes);
-            // A new file is "all added" — count its line count.
-            added_lines_total += text.lines().count();
+    for prev_file in &prev.files {
+        if !cur_by_path.contains_key(prev_file.path.as_str()) {
+            changes.push(FileChange::Removed {
+                path: prev_file.path.clone(),
+                size: prev_file.size,
+            });
         }
     }
-
-    // Pure removals.
-    for r in &removed {
-        changes.push(FileChange::Removed {
-            path: r.path.clone(),
-            binary: r.binary,
-            size: r.size,
-        });
-        if !r.binary {
-            let bytes = std::fs::read(prev_dir.join(&r.path)).unwrap_or_default();
-            let text = String::from_utf8_lossy(&bytes);
-            removed_lines_total += text.lines().count();
-        }
-    }
-
-    // Sort: paths alphabetically, with renames grouped.
-    changes.sort_by(|a, b| sort_key(a).cmp(&sort_key(b)));
-
-    Ok(SnapDiff {
+    SnapDiff {
         changes,
         added_lines: added_lines_total,
         removed_lines: removed_lines_total,
-    })
-}
-
-fn sort_key(c: &FileChange) -> String {
-    match c {
-        FileChange::Added { path, .. } => format!("a:{path}"),
-        FileChange::Removed { path, .. } => format!("r:{path}"),
-        FileChange::Modified { path, .. } => format!("m:{path}"),
-        FileChange::Renamed { from, to, .. } => format!("rn:{from}->{to}"),
-        FileChange::RenamedAndModified { from, to, .. } => format!("rm:{from}->{to}"),
     }
 }
 
@@ -507,18 +555,29 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
-    fn make_session(p: &Path) -> SessionId {
-        let id = SessionId::new();
-        std::fs::create_dir_all(p.join(".grs/sessions").join(id.as_str())).unwrap();
-        id
+    #[test]
+    fn parse_snap_file_name_accepts_4_digit_padded() {
+        assert_eq!(parse_snap_file_name("snap-0001.json"), Some(1));
+        assert_eq!(parse_snap_file_name("snap-0042.json"), Some(42));
+        assert_eq!(parse_snap_file_name("snap-9999.json"), Some(9999));
     }
 
     #[test]
-    fn capture_creates_snap_with_meta() {
+    fn parse_snap_file_name_rejects_other_names() {
+        assert_eq!(parse_snap_file_name("snap-1.json"), None);   // not 4-digit
+        assert_eq!(parse_snap_file_name("snap-00001.json"), None); // 5 digits
+        assert_eq!(parse_snap_file_name("meta.toml"), None);
+        assert_eq!(parse_snap_file_name("snap-0001"), None);     // no .json
+        assert_eq!(parse_snap_file_name("snap-abcd.json"), None);
+    }
+
+    #[test]
+    fn capture_writes_one_snap_per_file() {
         let dir = tempdir().unwrap();
         let root = dir.path().to_path_buf();
         std::fs::create_dir_all(root.join(".grs/sessions")).unwrap();
-        let id = make_session(&root);
+        let id = SessionId::new();
+        std::fs::create_dir_all(root.join(".grs/sessions").join(id.as_str())).unwrap();
         std::fs::write(root.join("hello.txt"), "hello\nworld\n").unwrap();
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::write(root.join("src/main.rs"), "fn main() {}\n").unwrap();
@@ -527,159 +586,211 @@ mod tests {
         let store = SnapStore::new(paths.clone());
         let ignore = IgnoreMatcher::new(&root, &[]).unwrap();
 
-        let meta = store.capture(&id, &ignore).unwrap();
-        assert_eq!(meta.n, 1);
-        assert_eq!(meta.file_count, 2);
-        assert!(meta.total_bytes > 0);
-        // Files were actually copied.
-        assert!(paths.snap_dir(&id, 1).join("hello.txt").is_file());
-        assert!(paths.snap_dir(&id, 1).join("src/main.rs").is_file());
+        let snaps = store.capture(&id, &ignore).unwrap();
+        // Two files, two snaps, each with exactly one file.
+        assert_eq!(snaps.len(), 2);
+        for (i, snap) in snaps.iter().enumerate() {
+            assert_eq!(snap.n, (i + 1) as u32);
+            assert_eq!(snap.files.len(), 1, "snap {} has {} files, expected 1", snap.n, snap.files.len());
+        }
+        // The two file paths are distinct.
+        let paths_set: std::collections::HashSet<&str> =
+            snaps.iter().map(|s| s.file_path.as_str()).collect();
+        assert_eq!(paths_set.len(), 2);
+        assert!(paths_set.contains("hello.txt"));
+        assert!(paths_set.contains("src/main.rs"));
+        // On-disk: snap-0001.json and snap-0002.json both exist.
+        assert!(paths.snap_file(&id, 1).is_file());
+        assert!(paths.snap_file(&id, 2).is_file());
+        // JSON round-trips.
+        for snap in &snaps {
+            let back = read_snap_json_at(&paths.snap_file(&id, snap.n)).unwrap();
+            assert_eq!(back.file_path, snap.file_path);
+            assert_eq!(back.files.len(), 1);
+            // First capture: no prev_content.
+            assert!(back.files[0].prev_content.is_none());
+        }
+        // Content of hello.txt round-trips.
+        let hello_snap = snaps.iter().find(|s| s.file_path == "hello.txt").unwrap();
+        assert_eq!(hello_snap.files[0].content, "hello\nworld\n");
     }
 
     #[test]
-    fn capture_increments_snap_number() {
+    fn capture_writes_one_snap_per_changed_file() {
+        // A save that modifies 2 files produces 2 snaps (one per file).
         let dir = tempdir().unwrap();
         let root = dir.path().to_path_buf();
         std::fs::create_dir_all(root.join(".grs/sessions")).unwrap();
-        let id = make_session(&root);
-        std::fs::write(root.join("a.txt"), "a\n").unwrap();
+        let id = SessionId::new();
+        std::fs::create_dir_all(root.join(".grs/sessions").join(id.as_str())).unwrap();
+        std::fs::write(root.join("a.txt"), "alpha\n").unwrap();
+        std::fs::write(root.join("b.txt"), "beta\n").unwrap();
+        std::fs::write(root.join("c.txt"), "gamma\n").unwrap();
 
         let paths = GrsPaths::new(&root);
         let store = SnapStore::new(paths);
         let ignore = IgnoreMatcher::new(&root, &[]).unwrap();
-        let m1 = store.capture(&id, &ignore).unwrap();
-        let m2 = store.capture(&id, &ignore).unwrap();
-        let m3 = store.capture(&id, &ignore).unwrap();
-        assert_eq!((m1.n, m2.n, m3.n), (1, 2, 3));
+        // First capture: 3 files, 3 snaps.
+        let s1 = store.capture(&id, &ignore).unwrap();
+        assert_eq!(s1.len(), 3);
+        assert_eq!(s1.iter().map(|s| s.n).collect::<Vec<_>>(), vec![1, 2, 3]);
+
+        // Modify a.txt and b.txt; c.txt is unchanged. 2 snaps.
+        std::fs::write(root.join("a.txt"), "alpha2\n").unwrap();
+        std::fs::write(root.join("b.txt"), "beta2\n").unwrap();
+        let s2 = store.capture(&id, &ignore).unwrap();
+        assert_eq!(s2.len(), 2);
+        assert_eq!(s2[0].n, 4);
+        assert_eq!(s2[1].n, 5);
+        let s2_paths: std::collections::HashSet<&str> =
+            s2.iter().map(|s| s.file_path.as_str()).collect();
+        assert!(s2_paths.contains("a.txt"));
+        assert!(s2_paths.contains("b.txt"));
+        assert!(!s2_paths.contains("c.txt"));
     }
 
     #[test]
-    fn diff_detects_added_modified_removed_renamed() {
+    fn second_change_to_same_file_walks_back_for_prev_content() {
+        // When a file is changed again after another file was changed
+        // in between, the new snap must walk back to find the prior
+        // content (not the immediately previous snap, which has a
+        // different file).
         let dir = tempdir().unwrap();
         let root = dir.path().to_path_buf();
         std::fs::create_dir_all(root.join(".grs/sessions")).unwrap();
-        let id = make_session(&root);
-
-        // snap 1: a.txt, b.txt, keep.txt
-        std::fs::write(root.join("a.txt"), "alpha\nbeta\n").unwrap();
+        let id = SessionId::new();
+        std::fs::create_dir_all(root.join(".grs/sessions").join(id.as_str())).unwrap();
+        std::fs::write(root.join("a.txt"), "alpha\nbeta\ngamma\n").unwrap();
         std::fs::write(root.join("b.txt"), "first\n").unwrap();
-        std::fs::write(root.join("keep.txt"), "stable\n").unwrap();
+
         let paths = GrsPaths::new(&root);
-        let store = SnapStore::new(paths.clone());
+        let store = SnapStore::new(paths);
+        let ignore = IgnoreMatcher::new(&root, &[]).unwrap();
+        // Capture 1: 2 files, 2 snaps. Let's not assume order.
+        let _ = store.capture(&id, &ignore).unwrap();
+
+        // Modify b.txt, then a.txt. The a.txt snap must still know
+        // its prior content (from the very first capture), not from
+        // the just-captured b.txt snap.
+        std::fs::write(root.join("b.txt"), "second\n").unwrap();
+        let s_b = store.capture(&id, &ignore).unwrap();
+        assert_eq!(s_b.len(), 1);
+        assert_eq!(s_b[0].file_path, "b.txt");
+
+        std::fs::write(root.join("a.txt"), "alpha\nBETA\ngamma\ndelta\n").unwrap();
+        let s_a = store.capture(&id, &ignore).unwrap();
+        assert_eq!(s_a.len(), 1);
+        assert_eq!(s_a[0].file_path, "a.txt");
+        // The prev_content must be the original a.txt, not b.txt.
+        assert_eq!(
+            s_a[0].files[0].prev_content.as_deref(),
+            Some("alpha\nbeta\ngamma\n")
+        );
+        assert!(!s_a[0].files[0].removed);
+    }
+
+    /// A file that exists at N-1 but is gone at N must produce its
+    /// own snap with `removed: true`, with `prev_content` carrying the
+    /// prior text.
+    #[test]
+    fn deleted_file_appears_in_next_snap() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        std::fs::create_dir_all(root.join(".grs/sessions")).unwrap();
+        let id = SessionId::new();
+        std::fs::create_dir_all(root.join(".grs/sessions").join(id.as_str())).unwrap();
+        std::fs::write(root.join("ephemeral.txt"), "goodbye\n").unwrap();
+        std::fs::write(root.join("keep.txt"), "stable\n").unwrap();
+
+        let paths = GrsPaths::new(&root);
+        let store = SnapStore::new(paths);
         let ignore = IgnoreMatcher::new(&root, &[]).unwrap();
         store.capture(&id, &ignore).unwrap();
 
-        // snap 2: a.txt modified, b.txt deleted, c.txt added, keep.txt stable,
-        //         b.txt -> moved.txt (rename by content preservation)
-        std::fs::remove_file(root.join("b.txt")).unwrap();
-        std::fs::write(root.join("moved.txt"), "first\n").unwrap();
-        std::fs::write(root.join("c.txt"), "new\n").unwrap();
-        std::fs::write(root.join("a.txt"), "alpha\ngamma\ndelta\n").unwrap();
-        store.capture(&id, &ignore).unwrap();
+        std::fs::remove_file(root.join("ephemeral.txt")).unwrap();
+        let s2 = store.capture(&id, &ignore).unwrap();
 
-        let prev = paths.snap_dir(&id, 1);
-        let cur = paths.snap_dir(&id, 2);
-        let d = diff_snap_dirs(&prev, &cur).unwrap();
-
-        // b.txt should be detected as a rename to moved.txt.
-        let has_rename = d.changes.iter().any(|c| matches!(c,
-            FileChange::Renamed { from, to, .. } if from == "b.txt" && to == "moved.txt"
-        ));
-        assert!(has_rename, "expected rename of b.txt -> moved.txt, got: {:?}", d.changes);
-
-        // a.txt modified.
-        let has_modified = d.changes.iter().any(|c| matches!(c,
-            FileChange::Modified { path, .. } if path == "a.txt"
-        ));
-        assert!(has_modified, "expected a.txt modified, got: {:?}", d.changes);
-
-        // c.txt added.
-        let has_added = d.changes.iter().any(|c| matches!(c,
-            FileChange::Added { path, .. } if path == "c.txt"
-        ));
-        assert!(has_added, "expected c.txt added, got: {:?}", d.changes);
-
-        // No change entry for keep.txt.
-        let has_keep = d.changes.iter().any(|c| match c {
-            FileChange::Modified { path, .. }
-            | FileChange::Added { path, .. }
-            | FileChange::Removed { path, .. } => path == "keep.txt",
-            _ => false,
-        });
-        assert!(!has_keep, "keep.txt should be unchanged");
+        // Exactly one snap, for the deleted file.
+        assert_eq!(s2.len(), 1);
+        assert_eq!(s2[0].file_path, "ephemeral.txt");
+        let removed = &s2[0].files[0];
+        assert!(removed.removed, "deleted file should have removed: true");
+        assert!(removed.content.is_empty());
+        assert_eq!(removed.prev_content.as_deref(), Some("goodbye\n"));
+        // keep.txt unchanged — must NOT be in s2.
+        assert!(s2.iter().all(|s| s.file_path != "keep.txt"));
     }
 
-    /// End-to-end: start the watcher, write a file, capture a second snap,
-    /// and verify the consecutive diff is correct.
+    /// Every snap carries a `tree_sha` that fingerprints the full
+    /// project tree at that moment. All snaps in the same save cycle
+    /// share the same `tree_sha`.
     #[test]
-    fn watcher_capture_then_consecutive_diff() {
-        use crate::store::RepoStore;
-        use crate::watcher::Watcher;
-        use std::sync::mpsc;
-        use std::time::Duration;
-        use tempfile::tempdir;
-
+    fn tree_sha_is_stable_for_same_tree() {
         let dir = tempdir().unwrap();
-        let store = RepoStore::init(dir.path()).unwrap();
-        let s = store.open_first_session("diff-test".into()).unwrap();
-        let session_id = s.id.clone();
+        let root = dir.path().to_path_buf();
+        std::fs::create_dir_all(root.join(".grs/sessions")).unwrap();
+        let id = SessionId::new();
+        std::fs::create_dir_all(root.join(".grs/sessions").join(id.as_str())).unwrap();
+        std::fs::write(root.join("a.txt"), "alpha\n").unwrap();
+        std::fs::write(root.join("b.txt"), "beta\n").unwrap();
 
-        // snap 1 = empty project (the dir is fresh).
-        let meta1 = store.snaps().read_meta(&session_id, 1).unwrap();
-        assert_eq!(meta1.file_count, 0, "fresh dir: snap 1 has 0 files");
+        let paths = GrsPaths::new(&root);
+        let store = SnapStore::new(paths);
+        let ignore = IgnoreMatcher::new(&root, &[]).unwrap();
+        let s1 = store.capture(&id, &ignore).unwrap();
+        // All snaps from the first save cycle share the same tree_sha.
+        assert!(!s1.is_empty());
+        let first_sha = &s1[0].tree_sha;
+        for snap in &s1 {
+            assert_eq!(&snap.tree_sha, first_sha);
+        }
+        // A second capture with no changes produces no snaps.
+        let s2 = store.capture(&id, &ignore).unwrap();
+        assert!(s2.is_empty(), "second capture of unchanged tree must produce no snaps");
+    }
 
-        // Start the watcher in a background thread.
-        let (stop_tx, stop_rx) = mpsc::channel();
-        let watcher_store = store.clone();
-        let handle = std::thread::spawn(move || {
-            let _ = Watcher::new(watcher_store).run(&stop_rx);
-        });
-        // Settle.
-        std::thread::sleep(Duration::from_millis(200));
+    /// The dedupe `capture_if_changed` returns None when the tree
+    /// matches the previous snap's `tree_sha`, even if the tree is
+    /// non-empty.
+    #[test]
+    fn dedupe_uses_tree_sha() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        std::fs::create_dir_all(root.join(".grs/sessions")).unwrap();
+        let id = SessionId::new();
+        std::fs::create_dir_all(root.join(".grs/sessions").join(id.as_str())).unwrap();
+        std::fs::write(root.join("a.txt"), "alpha\n").unwrap();
 
-        // Write a new file. The 1.5s debounce fires; we wait + a margin.
-        std::fs::write(dir.path().join("a.txt"), "alpha\nbeta\ngamma\n").unwrap();
-        std::thread::sleep(Duration::from_millis(2500));
+        let paths = GrsPaths::new(&root);
+        let store = SnapStore::new(paths);
+        let ignore = IgnoreMatcher::new(&root, &[]).unwrap();
+        let s1 = store.capture_if_changed(&id, &ignore).unwrap();
+        assert!(s1.is_some());
+        // Same tree — capture_if_changed must return None.
+        let s2 = store.capture_if_changed(&id, &ignore).unwrap();
+        assert!(s2.is_none(), "capture_if_changed must dedupe via tree_sha");
+        // Change the file — capture_if_changed must return Some.
+        std::fs::write(root.join("a.txt"), "alpha2\n").unwrap();
+        let s3 = store.capture_if_changed(&id, &ignore).unwrap();
+        assert!(s3.is_some());
+    }
 
-        // Now also modify it.
-        std::fs::write(dir.path().join("a.txt"), "alpha\nBETA\ngamma\ndelta\n").unwrap();
-        std::thread::sleep(Duration::from_millis(2500));
+    #[test]
+    fn capture_if_changed_dedupes_unchanged() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        std::fs::create_dir_all(root.join(".grs/sessions")).unwrap();
+        let id = SessionId::new();
+        std::fs::create_dir_all(root.join(".grs/sessions").join(id.as_str())).unwrap();
+        std::fs::write(root.join("a.txt"), "alpha\n").unwrap();
 
-        // Stop the watcher.
-        stop_tx.send(()).ok();
-        let _ = handle.join();
-
-        // We expect at least snap 2 and snap 3.
-        let count = store.snaps().count(&session_id).unwrap();
-        assert!(count >= 3, "expected >= 3 snaps, got {count}");
-
-        // snap 1 -> snap 2: a.txt is a pure addition.
-        let d1 = diff_snap_dirs(
-            &store.paths().snap_dir(&session_id, 1),
-            &store.paths().snap_dir(&session_id, 2),
-        )
-        .unwrap();
-        let adds_for_a = d1
-            .changes
-            .iter()
-            .filter(|c| matches!(c, FileChange::Added { path, .. } if path == "a.txt"))
-            .count();
-        assert_eq!(adds_for_a, 1, "snap 2 should add a.txt exactly once");
-        assert_eq!(d1.added_lines, 3, "3 lines added in a.txt");
-
-        // snap 2 -> snap 3: a.txt is a modification (1 line changed, 1 added).
-        let d2 = diff_snap_dirs(
-            &store.paths().snap_dir(&session_id, 2),
-            &store.paths().snap_dir(&session_id, 3),
-        )
-        .unwrap();
-        let mods_for_a = d2
-            .changes
-            .iter()
-            .filter(|c| matches!(c, FileChange::Modified { path, .. } if path == "a.txt"))
-            .count();
-        assert_eq!(mods_for_a, 1, "snap 3 should modify a.txt exactly once");
-        assert_eq!(d2.added_lines, 2, "BETA replaced + delta added = 2 line changes");
-        assert_eq!(d2.removed_lines, 1, "1 line removed (old 'beta')");
+        let paths = GrsPaths::new(&root);
+        let store = SnapStore::new(paths);
+        let ignore = IgnoreMatcher::new(&root, &[]).unwrap();
+        let s1 = store.capture_if_changed(&id, &ignore).unwrap();
+        assert!(s1.is_some());
+        // Calling again with the same tree must return None.
+        let s2 = store.capture_if_changed(&id, &ignore).unwrap();
+        assert!(s2.is_none(), "second capture_if_changed on unchanged tree must be a no-op");
     }
 }

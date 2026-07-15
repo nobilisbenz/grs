@@ -18,7 +18,21 @@ target/\n\
 dist/\n\
 build/\n\
 .grs/\n\
-.grsignore\n";
+.grsignore\n\
+# editor transient files — would otherwise create a snap per save\n\
+*~\n\
+.*~\n\
+*.swp\n\
+*.swo\n\
+*.swn\n\
+*.bak\n\
+*.tmp\n\
+*.orig\n\
+*.rej\n\
+.#*\n\
+.DS_Store\n\
+*.lock\n\
+*.lockb\n";
 
 pub struct IgnoreMatcher {
     root: PathBuf,
@@ -209,5 +223,39 @@ mod tests {
             .collect();
         assert!(names.contains(&"keep.txt".to_string()));
         assert!(!names.contains(&"drop.log".to_string()));
+    }
+
+    /// Editor transient files (vim `*~`, swap files, emacs lock files,
+    /// etc.) must be ignored by default. Otherwise a single editor save
+    /// creates a snap for each transient file the editor creates and
+    /// removes mid-save.
+    #[test]
+    fn editor_transients_are_ignored_by_default() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("keep.txt"), "x").unwrap();
+        for transient in [
+            "foo~", "foo.swp", "foo.swo", ".foo.swp", ".foo.swo",
+            "foo.bak", "foo.tmp", "foo.orig", "foo.rej",
+            ".#foo", "foo.lock", "foo.lockb", ".DS_Store",
+        ] {
+            std::fs::write(dir.path().join(transient), "junk").unwrap();
+        }
+        let m = IgnoreMatcher::new(dir.path(), &[]).unwrap();
+        let names: Vec<String> = m
+            .files()
+            .into_iter()
+            .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+            .collect();
+        assert!(names.contains(&"keep.txt".to_string()));
+        for transient in [
+            "foo~", "foo.swp", "foo.swo", ".foo.swp", ".foo.swo",
+            "foo.bak", "foo.tmp", "foo.orig", "foo.rej",
+            ".#foo", "foo.lock", "foo.lockb", ".DS_Store",
+        ] {
+            assert!(
+                !names.contains(&transient.to_string()),
+                "transient {transient:?} should be ignored, but it leaked into the file list: {names:?}"
+            );
+        }
     }
 }

@@ -12,7 +12,7 @@
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::style::Style;
+use ratatui::style::{Color, Style};
 use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders};
 use ratatui::Frame;
@@ -73,7 +73,13 @@ pub fn render(
 /// Write a single `Line`'s spans into `buf` starting at `(x, y)`, up to
 /// `max_width` cells. Spans that would overflow are truncated by
 /// `set_stringn` (it stops at the max width). No allocations.
+///
+/// Honors the line's row-level `style.bg`: each cell's bg is the line's
+/// bg (if set) and the span keeps its own fg. Without this, ratatui's
+/// `set_stringn` would paint each cell with the span's `bg` (which is
+/// unset for syntax-highlighted spans), wiping the row tint.
 fn write_line_to_buffer(buf: &mut Buffer, line: &Line, x: u16, y: u16, max_width: u16) {
+    let row_bg = line.style.bg;
     let mut cur_x = x;
     let end_x = x.saturating_add(max_width);
     for span in &line.spans {
@@ -87,16 +93,33 @@ fn write_line_to_buffer(buf: &mut Buffer, line: &Line, x: u16, y: u16, max_width
         // extra work is negligible either way.
         let remaining = (end_x - cur_x) as usize;
         let span_width = UnicodeWidthStr::width(text);
+        // Per-cell style: the row's bg, the span's fg. If the span
+        // explicitly sets its own bg, that wins (rare; only happens if
+        // a span wants to override the row tint).
+        let cell_style = match (row_bg, span.style.bg) {
+            (Some(rbg), None) | (Some(rbg), Some(Color::Reset)) => span.style.bg(rbg),
+            _ => span.style,
+        };
         if span_width <= remaining {
-            buf.set_stringn(cur_x, y, text, span_width, span.style);
+            buf.set_stringn(cur_x, y, text, span_width, cell_style);
             cur_x += span_width as u16;
         } else {
             // Truncate the string to fit the remaining width. Using
             // `set_stringn` with `remaining` as the max width handles the
             // visual truncation; we just need to avoid passing the full
             // string (which would be wasted work).
-            buf.set_stringn(cur_x, y, text, remaining, span.style);
+            buf.set_stringn(cur_x, y, text, remaining, cell_style);
             break;
+        }
+    }
+    // Paint the trailing cells of the row (after the last span, if any)
+    // with the row bg too — without this, the gutter to the right of
+    // the last span would be black on a tinted row.
+    if let Some(bg) = row_bg {
+        while cur_x < end_x {
+            let cell = buf.get_mut(cur_x, y);
+            cell.set_bg(bg);
+            cur_x += 1;
         }
     }
     // If the line had no spans, the cell at (x, y) is the buffer default
@@ -228,5 +251,53 @@ mod tests {
         // No panic; render completed. The line was truncated to the
         // inner width. We don't assert on the exact content because the
         // truncation point is in the middle of the span.
+    }
+
+    /// The line's row-level `style.bg` must be applied to every cell of
+    /// the row, not just the cells under spans. Without this, the
+    /// "added line" / "removed line" row tints are invisible — the
+    /// cells under the spans get the span's bg (default = terminal bg),
+    /// and the cells after the last span (and before the first span, if
+    /// any) get the terminal's default bg too.
+    #[test]
+    fn render_applies_line_bg_to_all_cells() {
+        let line_bg = Color::Rgb(0, 90, 0);
+        let mut state = FileViewState {
+            // A short line, then a long-ish line. The long line's row
+            // should be tinted across the entire inner width — including
+            // the cells after the last span.
+            lines: vec![
+                Line::from("ab").style(Style::default().bg(line_bg)),
+                Line::from("short").style(Style::default().bg(line_bg)),
+            ],
+            scroll: 0,
+        };
+        let backend = TestBackend::new(20, 4);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| render(f, &mut state, Rect::new(0, 0, 20, 4), None))
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+        // Inner area: x in [1, 19), y in [1, 3).
+        // Row at y=1 is the first line ("ab"). Both cells (1,1) and (2,1)
+        // should have the line bg, and the rest of the row (x=3..19) too.
+        for x in 1..19u16 {
+            let cell = buf.get(x, 1);
+            assert_eq!(
+                cell.bg, line_bg,
+                "row 1 cell at x={x} should have the line bg, got {:?}",
+                cell.bg
+            );
+        }
+        // Row at y=2 is the second line ("short"). The "short" span
+        // covers x=1..6, then x=6..19 should still be tinted.
+        for x in 1..19u16 {
+            let cell = buf.get(x, 2);
+            assert_eq!(
+                cell.bg, line_bg,
+                "row 2 cell at x={x} should have the line bg, got {:?}",
+                cell.bg
+            );
+        }
     }
 }
