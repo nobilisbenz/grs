@@ -36,6 +36,7 @@ grs-lib = { path = "grs-lib" }
 # dev dependencies
 insta = { version = "1", features = ["yaml"] }
 clap_mangen = "0.2"
+unicode-width = "0.1"
 
 [workspace.lints.clippy]
 uninlined_format_args = "warn"
